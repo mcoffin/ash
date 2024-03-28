@@ -19,7 +19,16 @@ quote = "1.0"
 regex = "1.4"
 vk-parse = { version = "0.12", features = ["vkxml-convert"] }
 vkxml = "0.3"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4.5", features = ["derive", "cargo", "env"] }
+lazy_static = "1.4"
 
 [dependencies.syn]
 version = "2.0"
 features = ["full", "extra-traits"]
+
+[features]
+default = []
+openxr = ["vk-parse/openxr"]

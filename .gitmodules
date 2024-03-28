@@ -2,3 +2,6 @@
 	path = generator/Vulkan-Headers
 	url = https://github.com/KhronosGroup/Vulkan-Headers
 	update = none
+[submodule "vk-parse"]
+	path = vk-parse
+	url = https://github.com/mcoffin/vk-parse.git

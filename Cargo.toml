@@ -3,9 +3,13 @@ resolver = "2"
 members = [
     "analysis",
     "ash",
+    "ash-xr",
     "ash-examples",
     "ash-rewrite",
     "ash-window",
     "generator",
     "generator-rewrite",
 ]
+
+[patch.crates-io.vk-parse]
+path = "./vk-parse"

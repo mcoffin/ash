@@ -8,6 +8,9 @@
     unused_qualifications
 )]
 
+#[macro_use]
+extern crate log;
+
 use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use itertools::Itertools;
 use nom::{
@@ -17,6 +20,7 @@ use nom::{
         char, digit1, hex_digit1, multispace0, multispace1, newline, none_of, one_of,
     },
     combinator::{map, map_res, opt, value},
+    error::{FromExternalError, ParseError},
     multi::{many1, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, terminated, tuple},
     IResult, Parser,
@@ -29,17 +33,31 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Display,
+    marker::PhantomData,
     ops::Not,
     path::Path,
 };
 use syn::Ident;
 
-const DESIRED_API: &str = "vulkan";
+pub mod vulkan;
+pub use vulkan::Vulkan;
 
-fn contains_desired_api(api: &str) -> bool {
-    api.split(',').any(|n| n == DESIRED_API)
-}
+#[cfg(feature = "openxr")]
+pub mod openxr;
+#[cfg(feature = "openxr")]
+pub use openxr::OpenXR;
 
+pub mod config;
+pub(crate) mod util;
+
+use util::*;
+use config::{
+    ApiConfig,
+    ApiExt,
+};
+
+#[doc(hidden)]
+#[macro_export]
 macro_rules! get_variant {
     ($variant:path) => {
         |enum_| match enum_ {
@@ -52,6 +70,14 @@ macro_rules! get_variant {
             $variant { $($member),+, .. } => Some(( $($member),+ )),
             _ => None,
         }
+    };
+}
+
+macro_rules! static_regex {
+    ($($name:ident = $s:expr),+ $(,)?) => {
+        $(
+            static $name: Lazy<Regex> = Lazy::new(|| Regex::new($s).unwrap());
+        )+
     };
 }
 
@@ -188,7 +214,7 @@ fn parse_c_define_header(i: &str) -> IResult<&str, (Option<&str>, (&str, Option<
     ))(i)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum CReferenceType {
     Value,
     PointerToConst,
@@ -197,6 +223,18 @@ enum CReferenceType {
     PointerToPointerToConst,
     PointerToConstPointer,
     PointerToConstPointerToConst,
+}
+
+impl CReferenceType {
+    fn inc(&mut self) {
+        use CReferenceType::*;
+        *self = match self {
+            Value => Pointer,
+            PointerToConst
+            | Pointer => PointerToPointer,
+            _ => panic!("CReferenceType cannot handle this type (too many levels of pointer misdirection"),
+        };
+    }
 }
 
 #[derive(Debug)]
@@ -211,12 +249,13 @@ fn parse_c_type(i: &str) -> IResult<&str, CParameterType<'_>> {
             tuple((
                 opt(tag("const ")),
                 preceded(opt(tag("struct ")), parse_c_identifier),
-                opt(char('*')),
+                multispace0,
+                opt(char('*'))
             )),
             multispace0,
             opt(pair(opt(tag("const")), char('*'))),
         ),
-        |((const_, name, firstptr), secondptr)| CParameterType {
+        |((const_, name, _, firstptr), secondptr)| CParameterType {
             name,
             reference_type: match (firstptr, secondptr) {
                 (None, None) => CReferenceType::Value,
@@ -248,6 +287,43 @@ struct CParameter<'a> {
     static_array: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CArraySuffix {
+    Dynamic,
+    Static(usize),
+}
+
+impl CArraySuffix {
+    fn parser<'a, E>() -> impl Parser<&'a str, Self, E>
+    where
+        E: ParseError<&'a str>,
+        E: FromExternalError<&'a str, std::num::ParseIntError>,
+    {
+        // fn parse_static_array(i: &str) -> IResult<&str, CArraySuffix> {
+        //     (map(
+        //         delimited(
+        //             char('['), map_res(digit1, str::parse), char(']')
+        //         ),
+        //         CArraySuffix::Static
+        //     ))(i)
+        // }
+        // fn parse_dynamic_array(i: &str) -> IResult<&str, CArraySuffix> {
+        //     (map(
+        //         pair(
+        //             char('['), char(']')
+        //         ),
+        //         |_| CArraySuffix::Dynamic
+        //     ))(i)
+        // }
+        // (alt((
+        //     parse_static_array,
+        //     parse_dynamic_array
+        // )))(i)
+        map(delimited(char('['), map_res(digit1, str::parse), char(']')), Self::Static)
+            .or(map(pair(char('['), char(']')), |_| Self::Dynamic))
+    }
+}
+
 /// Parses a single C parameter instance, for example:
 ///
 /// ```c
@@ -260,13 +336,22 @@ fn parse_c_parameter(i: &str) -> IResult<&str, CParameter<'_>> {
             multispace0,
             pair(
                 parse_c_identifier,
-                opt(delimited(char('['), map_res(digit1, str::parse), char(']'))),
+                opt(CArraySuffix::parser()),
             ),
         ),
-        |(type_, (name, static_array))| CParameter {
-            type_,
-            _name: name,
-            static_array,
+        |(mut type_, (name, arr))| {
+            let static_array = arr.and_then(|v| match v {
+                CArraySuffix::Static(len) => Some(len),
+                CArraySuffix::Dynamic => {
+                    type_.reference_type.inc();
+                    None
+                },
+            });
+            CParameter {
+                type_,
+                _name: name,
+                static_array,
+            }
         },
     ))(i)
 }
@@ -308,8 +393,8 @@ impl ConstVal {
     }
 }
 pub trait ConstantExt {
-    fn constant(&self, enum_name: &str) -> Constant;
-    fn variant_ident(&self, enum_name: &str) -> Ident;
+    fn constant<C: ApiConfig + ?Sized>(&self, enum_name: &str) -> Constant;
+    fn original_name(&self) -> &str;
     fn notation(&self) -> Option<&str>;
     fn formatted_notation(&self) -> Option<Cow<'_, str>> {
         static DOC_LINK: Lazy<Regex> = Lazy::new(|| Regex::new(r"<<([\w-]+)>>").unwrap());
@@ -330,11 +415,11 @@ pub trait ConstantExt {
 }
 
 impl ConstantExt for vkxml::ExtensionEnum {
-    fn constant(&self, _enum_name: &str) -> Constant {
+    fn constant<C: ApiConfig + ?Sized>(&self, _enum_name: &str) -> Constant {
         Constant::from_extension_enum(self).unwrap()
     }
-    fn variant_ident(&self, enum_name: &str) -> Ident {
-        variant_ident(enum_name, &self.name)
+    fn original_name(&self) -> &str {
+        &self.name
     }
     fn notation(&self) -> Option<&str> {
         self.notation.as_deref()
@@ -345,13 +430,13 @@ impl ConstantExt for vkxml::ExtensionEnum {
 }
 
 impl ConstantExt for vk_parse::Enum {
-    fn constant(&self, enum_name: &str) -> Constant {
-        Constant::from_vk_parse_enum(self, Some(enum_name), None)
+    fn constant<C: ApiConfig + ?Sized>(&self, enum_name: &str) -> Constant {
+        Constant::from_vk_parse_enum::<C>(self, Some(enum_name), None)
             .unwrap()
             .0
     }
-    fn variant_ident(&self, enum_name: &str) -> Ident {
-        variant_ident(enum_name, &self.name)
+    fn original_name(&self) -> &str {
+        &self.name
     }
     fn notation(&self) -> Option<&str> {
         self.comment.as_deref()
@@ -365,11 +450,11 @@ impl ConstantExt for vk_parse::Enum {
 }
 
 impl ConstantExt for vkxml::Constant {
-    fn constant(&self, _enum_name: &str) -> Constant {
+    fn constant<C: ApiConfig + ?Sized>(&self, _enum_name: &str) -> Constant {
         Constant::from_constant(self)
     }
-    fn variant_ident(&self, enum_name: &str) -> Ident {
-        variant_ident(enum_name, &self.name)
+    fn original_name(&self) -> &str {
+        &self.name
     }
     fn notation(&self) -> Option<&str> {
         self.notation.as_deref()
@@ -487,7 +572,7 @@ impl Constant {
     }
 
     /// Returns (Constant, optional base type, is_alias)
-    pub fn from_vk_parse_enum(
+    pub fn from_vk_parse_enum<C: ApiConfig + ?Sized>(
         enum_: &vk_parse::Enum,
         enum_name: Option<&str>,
         extension_number: Option<i64>,
@@ -522,7 +607,7 @@ impl Constant {
             }
             EnumSpec::Alias { alias, extends } => {
                 let base_type = extends.as_deref().or(enum_name)?;
-                let key = variant_ident(base_type, alias);
+                let key = variant_ident::<C>(base_type, alias);
                 if key == "DISPATCH_BASE" {
                     None
                 } else {
@@ -553,38 +638,6 @@ impl FeatureExt for vkxml::Feature {
         version.replace('.', "_")
     }
 }
-#[derive(Debug, Copy, Clone)]
-pub enum FunctionType {
-    Static,
-    Entry,
-    Instance,
-    Device,
-}
-pub trait CommandExt {
-    fn function_type(&self) -> FunctionType;
-}
-
-impl CommandExt for vk_parse::CommandDefinition {
-    fn function_type(&self) -> FunctionType {
-        let is_first_param_device = self.params.first().map_or(false, |field| {
-            matches!(
-                field.definition.type_name.as_deref(),
-                Some("VkDevice" | "VkCommandBuffer" | "VkQueue")
-            )
-        });
-        match self.proto.name.as_str() {
-            "vkGetInstanceProcAddr" => FunctionType::Static,
-            "vkCreateInstance"
-            | "vkEnumerateInstanceLayerProperties"
-            | "vkEnumerateInstanceExtensionProperties"
-            | "vkEnumerateInstanceVersion" => FunctionType::Entry,
-            // This is actually not a device level function
-            "vkGetDeviceProcAddr" => FunctionType::Instance,
-            _ if is_first_param_device => FunctionType::Device,
-            _ => FunctionType::Instance,
-        }
-    }
-}
 
 pub trait FieldExt {
     /// Returns the name of the parameter that doesn't clash with Rusts reserved
@@ -592,7 +645,7 @@ pub trait FieldExt {
     fn param_ident(&self) -> Ident;
 
     /// The inner type of this field, with one level of pointers removed
-    fn inner_type_tokens(
+    fn inner_type_tokens<C: ApiConfig + ?Sized>(
         &self,
         lifetime: Option<TokenStream>,
         inner_length: Option<usize>,
@@ -600,7 +653,7 @@ pub trait FieldExt {
 
     /// Returns reference-types wrapped in their safe variant. (Dynamic) arrays become
     /// slices, pointers become Rust references.
-    fn safe_type_tokens(
+    fn safe_type_tokens<C: ApiConfig + ?Sized>(
         &self,
         lifetime: TokenStream,
         type_lifetime: Option<TokenStream>,
@@ -610,7 +663,13 @@ pub trait FieldExt {
     /// Returns the basetype ident and removes the 'Vk' prefix. When `is_ffi_param` is `true`
     /// array types (e.g. `[f32; 3]`) will be converted to pointer types (e.g. `&[f32; 3]`),
     /// which is needed for `C` function parameters. Set to `false` for struct definitions.
-    fn type_tokens(&self, is_ffi_param: bool, type_lifetime: Option<TokenStream>) -> TokenStream;
+    fn type_tokens<C>(
+        &self,
+        is_ffi_param: bool,
+        type_lifetime: Option<TokenStream>,
+    ) -> TokenStream
+    where
+        C: ApiConfig + ?Sized;
 
     /// Whether this is C's `void` type (not to be mistaken with a void _pointer_!)
     fn is_void(&self) -> bool;
@@ -652,28 +711,6 @@ impl ToTokens for vkxml::ReferenceType {
         }
     }
 }
-fn name_to_tokens(type_name: &str) -> Ident {
-    let new_name = match type_name {
-        "uint8_t" => "u8",
-        "uint16_t" => "u16",
-        "uint32_t" => "u32",
-        "uint64_t" => "u64",
-        "int8_t" => "i8",
-        "int16_t" => "i16",
-        "int32_t" => "i32",
-        "int64_t" => "i64",
-        "size_t" => "usize",
-        "int" => "c_int",
-        "void" => "c_void",
-        "char" => "c_char",
-        "float" => "f32",
-        "double" => "f64",
-        "long" => "c_ulong",
-        _ => type_name.strip_prefix("Vk").unwrap_or(type_name),
-    };
-    let new_name = new_name.replace("FlagBits", "Flags");
-    format_ident!("{}", new_name)
-}
 
 /// Parses and rewrites a C literal into Rust
 ///
@@ -703,8 +740,8 @@ fn convert_c_literal(lit: Literal) -> Literal {
 /// Examples:
 /// - `VK_MAKE_VERSION(1, 2, VK_HEADER_VERSION)` -> `make_version(1, 2, HEADER_VERSION)`
 /// - `2*VK_UUID_SIZE` -> `2 * UUID_SIZE`
-fn convert_c_expression(c_expr: &str, identifier_renames: &BTreeMap<String, Ident>) -> TokenStream {
-    fn rewrite_token_stream(
+fn convert_c_expression<C: ApiConfig + ?Sized>(c_expr: &str, identifier_renames: &BTreeMap<String, Ident>) -> TokenStream {
+    fn rewrite_token_stream<Config: ApiConfig + ?Sized>(
         stream: TokenStream,
         identifier_renames: &BTreeMap<String, Ident>,
     ) -> TokenStream {
@@ -713,14 +750,14 @@ fn convert_c_expression(c_expr: &str, identifier_renames: &BTreeMap<String, Iden
             .map(|tt| match tt {
                 TokenTree::Group(group) => TokenTree::Group(Group::new(
                     group.delimiter(),
-                    rewrite_token_stream(group.stream(), identifier_renames),
+                    rewrite_token_stream::<Config>(group.stream(), identifier_renames),
                 )),
                 TokenTree::Ident(term) => {
                     let name = term.to_string();
                     identifier_renames
                         .get(&name)
                         .cloned()
-                        .unwrap_or_else(|| format_ident!("{}", constant_name(&name)))
+                        .unwrap_or_else(|| format_ident!("{}", Config::strip_constant_prefix(&name).unwrap_or(&name)))
                         .into()
                 }
                 TokenTree::Literal(lit) => TokenTree::Literal(convert_c_literal(lit)),
@@ -731,7 +768,7 @@ fn convert_c_expression(c_expr: &str, identifier_renames: &BTreeMap<String, Iden
     let c_expr = c_expr
         .parse()
         .unwrap_or_else(|_| panic!("Failed to parse `{c_expr}` as Rust"));
-    rewrite_token_stream(c_expr, identifier_renames)
+    rewrite_token_stream::<C>(c_expr, identifier_renames)
 }
 
 fn discard_outmost_delimiter(stream: TokenStream) -> TokenStream {
@@ -754,13 +791,13 @@ impl FieldExt for vkxml::Field {
         format_ident!("{}", name_corrected.to_snake_case())
     }
 
-    fn inner_type_tokens(
+    fn inner_type_tokens<C: ApiConfig + ?Sized>(
         &self,
         lifetime: Option<TokenStream>,
         inner_length: Option<usize>,
     ) -> TokenStream {
         assert!(!self.is_void());
-        let ty = name_to_tokens(&self.basetype);
+        let ty = C::name_to_tokens(&self.basetype);
 
         let (const_, borrow) = match (lifetime, inner_length) {
             // If the nested "dynamic array" has length 1, it's just a pointer which we convert to a safe borrow for convenience
@@ -775,7 +812,7 @@ impl FieldExt for vkxml::Field {
         }
     }
 
-    fn safe_type_tokens(
+    fn safe_type_tokens<C: ApiConfig + ?Sized>(
         &self,
         lifetime: TokenStream,
         type_lifetime: Option<TokenStream>,
@@ -784,13 +821,13 @@ impl FieldExt for vkxml::Field {
         assert!(!self.is_void());
         match self.array {
             // The outer type fn type_tokens() returns is [], which fits our "safe" prescription
-            Some(vkxml::ArrayType::Static) => self.type_tokens(false, type_lifetime),
+            Some(vkxml::ArrayType::Static) => self.type_tokens::<C>(false, type_lifetime),
             Some(vkxml::ArrayType::Dynamic) => {
-                let ty = self.inner_type_tokens(Some(lifetime), inner_length);
+                let ty = self.inner_type_tokens::<C>(Some(lifetime), inner_length);
                 quote!([#ty #type_lifetime])
             }
             None => {
-                let ty = name_to_tokens(&self.basetype);
+                let ty = C::name_to_tokens(&self.basetype);
                 let pointer = self
                     .reference
                     .as_ref()
@@ -800,20 +837,27 @@ impl FieldExt for vkxml::Field {
         }
     }
 
-    fn type_tokens(&self, is_ffi_param: bool, type_lifetime: Option<TokenStream>) -> TokenStream {
+    fn type_tokens<C>(
+        &self,
+        is_ffi_param: bool,
+        type_lifetime: Option<TokenStream>,
+    ) -> TokenStream
+    where
+        C: ApiConfig + ?Sized,
+    {
         assert!(!self.is_void());
-        let ty = name_to_tokens(&self.basetype);
+        let ty = C::name_to_tokens(&self.basetype);
 
-        if is_static_array(self) {
+        if let Some(size) = self
+            .size_enumref
+            .as_ref()
+            .or(self.size.as_ref())
+            .filter(|_| is_static_array(self)) {
+
             assert!(self.reference.is_none());
-            let size = self
-                .size_enumref
-                .as_ref()
-                .or(self.size.as_ref())
-                .expect("Should have size");
             // Make sure we also rename the constant, that is
             // used inside the static array
-            let size = convert_c_expression(size, &BTreeMap::new());
+            let size = convert_c_expression::<C>(size, &BTreeMap::new());
             // arrays in c are always passed as a pointer
             if is_ffi_param {
                 quote!(*const [#ty; #size])
@@ -824,7 +868,7 @@ impl FieldExt for vkxml::Field {
             let pointer = self.reference.as_ref().map(|r| r.to_tokens(self.is_const));
             if self.is_pointer_to_static_sized_array() {
                 let size = self.c_size.as_ref().expect("Should have c_size");
-                let size = convert_c_expression(size, &BTreeMap::new());
+                let size = convert_c_expression::<C>(size, &BTreeMap::new());
                 quote!(#pointer [#ty #type_lifetime; #size])
             } else {
                 quote!(#pointer #ty #type_lifetime)
@@ -854,28 +898,44 @@ impl FieldExt for vk_parse::CommandParam {
         format_ident!("{}", name_corrected.to_snake_case())
     }
 
-    fn inner_type_tokens(
+    fn inner_type_tokens<C>(
         &self,
         _lifetime: Option<TokenStream>,
         _inner_length: Option<usize>,
-    ) -> TokenStream {
+    ) -> TokenStream
+    where
+        C: ApiConfig + ?Sized,
+    {
         unimplemented!()
     }
 
-    fn safe_type_tokens(
+    fn safe_type_tokens<C>(
         &self,
         _lifetime: TokenStream,
         _type_lifetime: Option<TokenStream>,
         _inner_length: Option<usize>,
-    ) -> TokenStream {
+    ) -> TokenStream
+    where
+        C: ApiConfig + ?Sized,
+    {
         unimplemented!()
     }
 
-    fn type_tokens(&self, is_ffi_param: bool, type_lifetime: Option<TokenStream>) -> TokenStream {
+    fn type_tokens<C>(
+        &self,
+        is_ffi_param: bool,
+        type_lifetime: Option<TokenStream>,
+    ) -> TokenStream
+    where
+        C: ApiConfig + ?Sized,
+    {
         assert!(!self.is_void(), "{:?}", self);
         let (rem, ty) = parse_c_parameter(&self.definition.code).unwrap();
+        if !rem.is_empty() {
+            panic!("Leftover tokens: {:?} while parsing code:\n{}", rem, &self.definition.code);
+        }
         assert!(rem.is_empty());
-        let type_name = name_to_tokens(ty.type_.name);
+        let type_name = C::name_to_tokens(ty.type_.name);
         let type_name = quote!(#type_name #type_lifetime);
         let inner_ty = match ty.type_.reference_type {
             CReferenceType::Value => quote!(#type_name),
@@ -909,14 +969,17 @@ impl FieldExt for vk_parse::CommandParam {
 
 pub type CommandMap<'a> = HashMap<vkxml::Identifier, &'a vk_parse::CommandDefinition>;
 
-fn generate_function_pointers<'a>(
+fn generate_function_pointers<'a, C>(
     ident: Ident,
     module: Option<(&str, &Ident)>,
     commands: &[&'a vk_parse::CommandDefinition],
     rename_commands: &HashMap<&'a str, &'a str>,
     fn_cache: &mut HashMap<&'a str, (Ident, Ident)>,
     has_lifetimes: &HashSet<Ident>,
-) -> TokenStream {
+) -> TokenStream
+where
+    C: ApiConfig + ?Sized,
+{
     // Commands can have duplicates inside them because they are declared per features. But we only
     // really want to generate one function pointer.
     let commands = commands
@@ -940,31 +1003,32 @@ fn generate_function_pointers<'a>(
         .iter()
         .map(|cmd| {
             let name = &cmd.proto.name;
-            let pfn_type_name = format_ident!("PFN_{}", name);
+            let pfn_type_name = C::function_pointer_name(name);
 
             // We might need to generate a function pointer for an extension, where we are given the original
             // `cmd` and a rename back to the extension alias (typically with vendor suffix) in `rename_commands`:
             let function_name_c = rename_commands.get(name.as_str()).cloned().unwrap_or(name);
 
-            let type_name = function_name_c.strip_prefix("vk").unwrap();
+            let type_name = C::strip_command_prefix(function_name_c)
+                .unwrap_or(function_name_c);
             let function_name_rust = format_ident!("{}", type_name.to_snake_case());
             let type_name = format_ident!("{}", type_name);
 
             let params = cmd
                 .params
                 .iter()
-                .filter(|param| matches!(param.api.as_deref(), None | Some(DESIRED_API)));
+                .filter(|param| param.api.is_none() || param.api.as_deref() == Some(C::NAME));
 
             let params_tokens: Vec<_> = params
                 .clone()
                 .map(|param| {
                     let name = param.param_ident();
                     let type_lifetime = has_lifetimes
-                        .contains(&name_to_tokens(
+                        .contains(&C::name_to_tokens(
                             param.definition.type_name.as_ref().unwrap(),
                         ))
                         .then(|| quote!(<'_>));
-                    let ty = param.type_tokens(true, type_lifetime);
+                    let ty = param.type_tokens::<C>(true, type_lifetime);
                     (name, ty)
                 })
                 .collect();
@@ -1015,7 +1079,7 @@ fn generate_function_pointers<'a>(
                 returns: if ret == "void" {
                     quote!()
                 } else {
-                    let ret_ty_tokens = name_to_tokens(ret);
+                    let ret_ty_tokens = C::name_to_tokens(ret);
                     quote!(-> #ret_ty_tokens)
                 },
                 parameter_validstructs,
@@ -1023,8 +1087,8 @@ fn generate_function_pointers<'a>(
         })
         .collect::<Vec<_>>();
 
-    struct CommandToParamTraits<'a>(&'a Command<'a>);
-    impl<'a> quote::ToTokens for CommandToParamTraits<'a> {
+    struct CommandToParamTraits<'a, C: ApiConfig + ?Sized>(&'a Command<'a>, PhantomData<&'a C>);
+    impl<'a, C: ApiConfig + ?Sized> quote::ToTokens for CommandToParamTraits<'a, C> {
         fn to_tokens(&self, tokens: &mut TokenStream) {
             for (param_ident, validstructs) in &self.0.parameter_validstructs {
                 let param_ident = param_ident.to_string();
@@ -1050,7 +1114,7 @@ fn generate_function_pointers<'a>(
                 .to_tokens(tokens);
 
                 for validstruct in validstructs {
-                    let structname = name_to_tokens(validstruct);
+                    let structname = C::name_to_tokens(validstruct);
                     quote!(unsafe impl #param_trait_name for #structname<'_> {}).to_tokens(tokens);
                 }
             }
@@ -1071,13 +1135,14 @@ fn generate_function_pointers<'a>(
         }
     }
 
-    struct CommandToMember<'a>(&'a Command<'a>);
-    impl<'a> quote::ToTokens for CommandToMember<'a> {
+    struct CommandToMember<'a, C: ApiConfig + ?Sized>(&'a Command<'a>, PhantomData<&'a C>);
+    impl<'a, C: ApiConfig + ?Sized> quote::ToTokens for CommandToMember<'a, C> {
         fn to_tokens(&self, tokens: &mut TokenStream) {
             let type_name = &self.0.pfn_type_name;
+            let mod_ident = Ident::new(C::MODULE_NAME, Span::call_site());
             let type_name = if let Some((vendor, ext)) = &self.0.type_in_module {
                 // Type is defined in another module
-                quote!(crate::vk::#vendor::#ext::#type_name)
+                quote!(crate::#mod_ident::#vendor::#ext::#type_name)
             } else {
                 // Type is defined in local scope
                 quote!(#type_name)
@@ -1130,12 +1195,12 @@ fn generate_function_pointers<'a>(
         }
     });
 
-    let param_traits = commands.iter().map(CommandToParamTraits);
+    let param_traits = commands.iter().map(|v| CommandToParamTraits::<C>(v, PhantomData));
     let pfn_typedefs = commands
         .iter()
         .filter(|pfn| pfn.type_in_module.is_none())
         .map(CommandToType);
-    let members = commands.iter().map(CommandToMember);
+    let members = commands.iter().map(|v| CommandToMember::<'_, C>(v, PhantomData));
 
     let struct_contents = if commands.is_empty() {
         quote! { pub struct #ident; }
@@ -1166,12 +1231,15 @@ pub struct ExtensionConstant<'a> {
     pub notation: Option<&'a str>,
 }
 impl<'a> ConstantExt for ExtensionConstant<'a> {
-    fn constant(&self, _enum_name: &str) -> Constant {
+    fn constant<C: ApiConfig + ?Sized>(&self, _enum_name: &str) -> Constant {
         self.constant.clone()
     }
-    fn variant_ident(&self, enum_name: &str) -> Ident {
-        variant_ident(enum_name, self.name)
+    fn original_name(&self) -> &str {
+        self.name
     }
+    // fn variant_ident<C: ApiConfig + ?Sized>(&self, enum_name: &str, config: &C) -> Ident {
+    //     variant_ident(enum_name, self.name, config)
+    // }
     fn notation(&self) -> Option<&str> {
         self.notation
     }
@@ -1181,20 +1249,23 @@ impl<'a> ConstantExt for ExtensionConstant<'a> {
     }
 }
 
-pub fn generate_extension_constants<'a>(
+pub fn generate_extension_constants<'a, C>(
     extension_name: &str,
     extension_number: i64,
     extension_items: &'a [vk_parse::ExtensionChild],
     const_cache: &mut HashSet<&'a str>,
     const_values: &mut BTreeMap<Ident, ConstantTypeInfo>,
-) -> TokenStream {
+) -> TokenStream
+where
+    C: ApiConfig + ?Sized,
+{
     let items = extension_items
         .iter()
         .filter_map(get_variant!(vk_parse::ExtensionChild::Require {
             api,
             items
         }))
-        .filter(|(api, _items)| matches!(api.as_deref(), None | Some(DESIRED_API)))
+        .filter(|(api, _items)| api.is_none() || api.as_deref() == Some(C::NAME))
         .flat_map(|(_api, items)| items);
 
     let mut extended_enums = BTreeMap::<String, Vec<ExtensionConstant<'_>>>::new();
@@ -1205,7 +1276,7 @@ pub fn generate_extension_constants<'a>(
                 continue;
             }
 
-            if !matches!(enum_.api.as_deref(), None | Some(DESIRED_API)) {
+            if !(enum_.api.is_none() || enum_.api.as_deref() == Some(C::NAME)) {
                 continue;
             }
 
@@ -1214,7 +1285,7 @@ pub fn generate_extension_constants<'a>(
             }
 
             let (constant, extends, is_alias) = if let Some(r) =
-                Constant::from_vk_parse_enum(enum_, None, Some(extension_number))
+                Constant::from_vk_parse_enum::<C>(enum_, None, Some(extension_number))
             {
                 r
             } else {
@@ -1230,13 +1301,20 @@ pub fn generate_extension_constants<'a>(
                 constant,
                 notation: enum_.comment.as_deref(),
             };
-            let ident = name_to_tokens(&extends);
+            let ident = C::name_to_tokens(&extends);
+            let fuck_tmp = const_values.keys()
+                .map(Clone::clone)
+                .collect::<Vec<_>>();
+            let extends_ = &extends;
             const_values
                 .get_mut(&ident)
-                .unwrap()
+                .unwrap_or_else(move || {
+                    error!("{:?}", fuck_tmp);
+                    panic!("failed to find const values for identifier {} from extends: {}", &ident, extends_);
+                })
                 .values
                 .push(ConstantMatchInfo {
-                    ident: ext_constant.variant_ident(&extends),
+                    ident: variant_ident::<C>(&extends, ext_constant.original_name()),
                     is_alias,
                 });
 
@@ -1248,9 +1326,9 @@ pub fn generate_extension_constants<'a>(
     }
 
     let enum_tokens = extended_enums.iter().map(|(extends, constants)| {
-        let ident = name_to_tokens(extends);
+        let ident = C::name_to_tokens(extends);
         let doc_string = format!("Generated from '{extension_name}'");
-        let impl_block = bitflags_impl_block(ident, extends, &constants.iter().collect_vec());
+        let impl_block = bitflags_impl_block::<C>(ident, extends, &constants.iter().collect_vec());
         quote! {
             #[doc = #doc_string]
             #impl_block
@@ -1258,14 +1336,17 @@ pub fn generate_extension_constants<'a>(
     });
     quote!(#(#enum_tokens)*)
 }
-pub fn generate_extension_commands<'a>(
+pub fn generate_extension_commands<'a, C>(
     extension_name: &'a str,
     items: &'a [vk_parse::ExtensionChild],
     cmd_map: &CommandMap<'a>,
     cmd_aliases: &HashMap<&'a str, &'a str>,
     fn_cache: &mut HashMap<&'a str, (Ident, Ident)>,
     has_lifetimes: &HashSet<Ident>,
-) -> (&'a str, TokenStream) {
+) -> (&'a str, TokenStream)
+where
+    C: ApiConfig + ?Sized,
+{
     let spec_version = items
         .iter()
         .filter_map(get_variant!(vk_parse::ExtensionChild::Require { items }))
@@ -1283,7 +1364,7 @@ pub fn generate_extension_commands<'a>(
 
     let byte_name_ident = Literal::byte_string(format!("{extension_name}\0").as_bytes());
 
-    let extension_name = extension_name.strip_prefix("VK_").unwrap();
+    let extension_name = C::strip_constant_prefix(extension_name).unwrap();
     let (vendor, extension_ident) = extension_name.split_once('_').unwrap();
     let extension_ident = match extension_ident.chars().next().unwrap().is_ascii_digit() {
         false => format_ident!("{}", extension_ident.to_lowercase()),
@@ -1301,7 +1382,7 @@ pub fn generate_extension_commands<'a>(
             api,
             items
         }))
-        .filter(|(api, _items)| matches!(api.as_deref(), None | Some(DESIRED_API)))
+        .filter(|(api, _items)| api.is_none() || api.as_deref() == Some(C::NAME))
         .flat_map(|(_api, items)| items)
         .filter_map(get_variant!(vk_parse::InterfaceItem::Command { name }));
 
@@ -1316,17 +1397,19 @@ pub fn generate_extension_commands<'a>(
         }
 
         let command = cmd_map[name];
-        match command.function_type() {
-            FunctionType::Static | FunctionType::Entry => unreachable!(),
-            FunctionType::Instance => instance_commands.push(command),
-            FunctionType::Device => device_commands.push(command),
+        match C::function_type(command) {
+            config::FunctionType::Static | config::FunctionType::Entry => unreachable!(),
+            config::FunctionType::Dispatched("Instance") => instance_commands.push(command),
+            config::FunctionType::Dispatched("Device") => device_commands.push(command),
+            config::FunctionType::Dispatched(ty) =>
+                panic!("invalid dispatch function type: {}", ty),
         }
     }
 
     let instance_fp = (!instance_commands.is_empty()).then(|| {
         let instance_ident = format_ident!("InstanceFn");
 
-        generate_function_pointers(
+        generate_function_pointers::<C>(
             instance_ident,
             Some((&vendor, &extension_ident)),
             &instance_commands,
@@ -1339,7 +1422,7 @@ pub fn generate_extension_commands<'a>(
     let device_fp = (!device_commands.is_empty()).then(|| {
         let device_ident = format_ident!("DeviceFn");
 
-        generate_function_pointers(
+        generate_function_pointers::<C>(
             device_ident,
             Some((&vendor, &extension_ident)),
             &device_commands,
@@ -1367,10 +1450,10 @@ pub fn generate_extension_commands<'a>(
     )
 }
 
-pub fn generate_define(
+pub fn generate_define<C: ApiConfig + ?Sized>(
     define: &vk_parse::Type,
     allowed_types: &HashSet<&str>,
-    identifier_renames: &mut BTreeMap<String, Ident>,
+    _identifier_renames: &mut BTreeMap<String, Ident>,
 ) -> TokenStream {
     let vk_parse::TypeSpec::Code(spec) = &define.spec else {
         return quote!();
@@ -1378,65 +1461,24 @@ pub fn generate_define(
     let [vk_parse::TypeCodeMarkup::Name(define_name), ..] = &spec.markup[..] else {
         return quote!();
     };
-
-    if !allowed_types.contains(define_name.as_str()) {
+    if !allowed_types.contains(define_name.as_str()) && !C::IGNORE_REQUIRED {
         return quote!();
     }
-
-    let name = constant_name(define_name);
-    let ident = format_ident!("{}", name);
-
-    if define_name.contains("VERSION") && !spec.code.contains("//#define") {
-        let link = khronos_link(define_name);
-        let (c_expr, (comment, (_name, parameters))) = parse_c_define_header(&spec.code).unwrap();
-        let c_expr = c_expr.trim().trim_start_matches('\\');
-        let c_expr = c_expr.replace("(uint32_t)", "");
-        let c_expr = convert_c_expression(&c_expr, identifier_renames);
-        let c_expr = discard_outmost_delimiter(c_expr);
-
-        let deprecated = comment
-            .and_then(|c| c.trim().strip_prefix("DEPRECATED: "))
-            .map(|comment| quote!(#[deprecated = #comment]))
-            .or_else(|| match define.deprecated.as_ref()?.as_str() {
-                "true" => Some(quote!(#[deprecated])),
-                "aliased" => {
-                    Some(quote!(#[deprecated = "an old name not following Vulkan conventions"]))
-                }
-                x => panic!("Unknown deprecation reason {}", x),
-            });
-
-        let (code, ident) = if let Some(parameters) = parameters {
-            let params = parameters
-                .iter()
-                .map(|param| format_ident!("{}", param))
-                .map(|i| quote!(#i: u32));
-            let ident = format_ident!("{}", name.to_lowercase());
-            (
-                quote!(pub const fn #ident(#(#params),*) -> u32 { #c_expr }),
-                ident,
-            )
-        } else {
-            (quote!(pub const #ident: u32 = #c_expr;), ident)
-        };
-
-        identifier_renames.insert(define_name.clone(), ident);
-
-        quote! {
-            #deprecated
-            #[doc = #link]
-            #code
-        }
-    } else {
-        quote!()
-    }
+    C::generate_define(define_name, spec)
+        .unwrap_or_else(|| quote!())
 }
-pub fn generate_typedef(typedef: &vkxml::Typedef) -> TokenStream {
+pub fn generate_typedef<C>(
+    typedef: &vkxml::Typedef,
+) -> TokenStream
+where
+    C: ApiConfig + ?Sized,
+{
     if typedef.basetype.is_empty() {
         // Ignore forward declarations
         quote! {}
     } else {
-        let typedef_name = name_to_tokens(&typedef.name);
-        let typedef_ty = name_to_tokens(&typedef.basetype);
+        let typedef_name = C::name_to_tokens(&typedef.name);
+        let typedef_ty = C::name_to_tokens(&typedef.basetype);
         let khronos_link = khronos_link(&typedef.name);
         quote! {
             #[doc = #khronos_link]
@@ -1444,11 +1486,14 @@ pub fn generate_typedef(typedef: &vkxml::Typedef) -> TokenStream {
         }
     }
 }
-pub fn generate_bitmask(
+pub fn generate_bitmask<C>(
     bitmask: &vkxml::Bitmask,
     bitflags_cache: &mut HashSet<Ident>,
     const_values: &mut BTreeMap<Ident, ConstantTypeInfo>,
-) -> Option<TokenStream> {
+) -> Option<TokenStream>
+where
+    C: ApiConfig + ?Sized,
+{
     // Workaround for empty bitmask
     if bitmask.name.is_empty() {
         return None;
@@ -1458,14 +1503,14 @@ pub fn generate_bitmask(
         return None;
     }
 
-    let name = bitmask.name.strip_prefix("Vk").unwrap();
+    let name = C::strip_type_prefix(&bitmask.name).unwrap();
     let ident = format_ident!("{}", name);
     if !bitflags_cache.insert(ident.clone()) {
         return None;
     };
     const_values.insert(ident.clone(), Default::default());
     let khronos_link = khronos_link(&bitmask.name);
-    let type_ = name_to_tokens(&bitmask.basetype);
+    let type_ = C::name_to_tokens(&bitmask.basetype);
     Some(quote! {
         #[repr(transparent)]
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1475,97 +1520,12 @@ pub fn generate_bitmask(
     })
 }
 
-pub enum EnumType {
+pub enum EnumCode {
     Bitflags(TokenStream),
     Enum(TokenStream),
 }
 
-static TRAILING_NUMBER: Lazy<Regex> = Lazy::new(|| Regex::new("(\\d+)$").unwrap());
-
-pub fn variant_ident(enum_name: &str, variant_name: &str) -> Ident {
-    let variant_name = variant_name.to_uppercase();
-    let name = enum_name.replace("FlagBits", "");
-    // TODO: Should be read from vk.xml id:2
-    // TODO: Also needs to be more robust, vendor names can be substrings from itself, id:4
-    // like NVX and NV
-    let vendors = [
-        "_AMD",
-        "_AMDX",
-        "_ANDROID",
-        "_ARM",
-        "_BRCM",
-        "_CHROMIUM",
-        "_EXT",
-        "_FB",
-        "_FSL",
-        "_FUCHSIA",
-        "_GGP",
-        "_GOOGLE",
-        "_HUAWEI",
-        "_IMG",
-        "_INTEL",
-        "_JUICE",
-        "_KDAB",
-        "_KHR",
-        "_KHX",
-        "_LUNARG",
-        "_MESA",
-        "_MSFT",
-        "_MVK",
-        "_NN",
-        "_NV",
-        "_NVX",
-        "_NXP",
-        "_NZXT",
-        "_QCOM",
-        "_QNX",
-        "_RASTERGRID",
-        "_RENDERDOC",
-        "_SAMSUNG",
-        "_SEC",
-        "_TIZEN",
-        "_VALVE",
-        "_VIV",
-        "_VSI",
-    ];
-    let struct_name = name.to_shouty_snake_case();
-    let vendor = vendors
-        .iter()
-        .find(|&vendor| struct_name.ends_with(vendor))
-        .cloned()
-        .unwrap_or("");
-    let struct_name = struct_name.strip_suffix(vendor).unwrap();
-    let struct_name = TRAILING_NUMBER.replace(struct_name, "_$1");
-    let variant_name = variant_name.strip_suffix(vendor).unwrap_or(&variant_name);
-
-    let new_variant_name = variant_name
-        .strip_prefix(struct_name.as_ref())
-        .unwrap_or_else(|| {
-            if enum_name == "VkResult" {
-                variant_name.strip_prefix("VK").unwrap()
-            } else {
-                panic!("Failed to strip {struct_name} prefix from enum variant {variant_name}")
-            }
-        });
-
-    // Both of the above strip_prefix leave a leading `_`:
-    let new_variant_name = new_variant_name.strip_prefix('_').unwrap();
-    // Replace _BIT anywhere in the string, also works when there's a trailing
-    // vendor extension in the variant name that's not in the enum/type name:
-    let new_variant_name = new_variant_name.replace("_BIT", "");
-    let is_digit = new_variant_name
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false);
-    if is_digit {
-        format_ident!("TYPE_{}", new_variant_name)
-    } else {
-        format_ident!("{}", new_variant_name)
-    }
-}
-
-pub fn bitflags_impl_block(
+pub fn bitflags_impl_block<C: ApiConfig + ?Sized>(
     ident: Ident,
     enum_name: &str,
     constants: &[&impl ConstantExt],
@@ -1574,9 +1534,9 @@ pub fn bitflags_impl_block(
         .iter()
         .filter(|constant| !constant.is_deprecated())
         .map(|constant| {
-            let variant_ident = constant.variant_ident(enum_name);
+            let variant_ident = variant_ident::<C>(enum_name, constant.original_name());
             let notation = constant.doc_attribute();
-            let constant = constant.constant(enum_name);
+            let constant = constant.constant::<C>(enum_name);
             let value = if let Constant::Alias(_) = &constant {
                 quote!(#constant)
             } else {
@@ -1596,15 +1556,19 @@ pub fn bitflags_impl_block(
     }
 }
 
-pub fn generate_enum<'a>(
+pub fn generate_enum<'a, C>(
     enum_: &'a vk_parse::Enums,
     const_cache: &mut HashSet<&'a str>,
     const_values: &mut BTreeMap<Ident, ConstantTypeInfo>,
     bitflags_cache: &mut HashSet<Ident>,
-) -> EnumType {
+) -> EnumCode
+where
+    C: ApiConfig + ?Sized,
+{
     let name = enum_.name.as_ref().unwrap();
-    let clean_name = name.strip_prefix("Vk").unwrap();
-    let clean_name = clean_name.replace("FlagBits", "Flags");
+    debug!("generating enum type: {}", name);
+    let clean_name = C::strip_type_prefix(name).unwrap_or(name);
+    let clean_name = clean_name.bits_to_flags();
     let ident = format_ident!("{}", clean_name);
     let constants = enum_
         .children
@@ -1617,7 +1581,7 @@ pub fn generate_enum<'a>(
     for constant in &constants {
         const_cache.insert(constant.name.as_str());
         values.push(ConstantMatchInfo {
-            ident: constant.variant_ident(name),
+            ident: variant_ident::<C>(name, constant.original_name()),
             is_alias: constant.is_alias(),
         });
     }
@@ -1631,7 +1595,9 @@ pub fn generate_enum<'a>(
 
     let khronos_link = khronos_link(name);
 
-    if name.contains("Bit") {
+    assert_eq!(name.contains("Bit"), enum_.ty() == Some(EnumType::Bitmask));
+
+    if enum_.ty() == Some(EnumType::Bitmask) {
         let ident = format_ident!("{}", clean_name);
 
         let type_ = if enum_.bitwidth == Some(64u32) {
@@ -1641,9 +1607,9 @@ pub fn generate_enum<'a>(
         };
 
         if !bitflags_cache.insert(ident.clone()) {
-            EnumType::Bitflags(quote! {})
+            EnumCode::Bitflags(quote! {})
         } else {
-            let impl_bitflags = bitflags_impl_block(ident.clone(), name, &constants);
+            let impl_bitflags = bitflags_impl_block::<C>(ident.clone(), name, &constants);
             let q = quote! {
                 #[repr(transparent)]
                 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1652,16 +1618,16 @@ pub fn generate_enum<'a>(
                 vk_bitflags_wrapped!(#ident, #type_);
                 #impl_bitflags
             };
-            EnumType::Bitflags(q)
+            EnumCode::Bitflags(q)
         }
     } else {
         let (struct_attribute, special_quote) = match clean_name.as_str() {
             //"StructureType" => generate_structure_type(&_name, _enum, create_info_constants),
-            "Result" => (quote!(#[must_use]), generate_result(ident.clone(), enum_)),
+            "Result" => (quote!(#[must_use]), generate_result::<C>(ident.clone(), enum_)),
             _ => (quote!(), quote!()),
         };
 
-        let impl_block = bitflags_impl_block(ident.clone(), name, &constants);
+        let impl_block = bitflags_impl_block::<C>(ident.clone(), name, &constants);
         let enum_quote = quote! {
             #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
             #[repr(transparent)]
@@ -1681,11 +1647,11 @@ pub fn generate_enum<'a>(
             #special_quote
 
         };
-        EnumType::Enum(q)
+        EnumCode::Enum(q)
     }
 }
 
-fn generate_result(ident: Ident, enum_: &vk_parse::Enums) -> TokenStream {
+fn generate_result<C: ApiConfig + ?Sized>(ident: Ident, enum_: &vk_parse::Enums) -> TokenStream {
     let notation = enum_.children.iter().filter_map(|elem| {
         let (variant_name, notation) = match elem {
             vk_parse::EnumsChild::Enum(constant) => (
@@ -1697,7 +1663,7 @@ fn generate_result(ident: Ident, enum_: &vk_parse::Enums) -> TokenStream {
             }
         };
 
-        let variant_ident = variant_ident(enum_.name.as_ref().unwrap(), variant_name);
+        let variant_ident = variant_ident::<C>(enum_.name.as_ref().unwrap(), variant_name);
         Some(quote! {
             Self::#variant_ident => Some(#notation)
         })
@@ -1734,13 +1700,16 @@ fn is_static_array(field: &vkxml::Field) -> bool {
     }
 }
 
-fn derive_default(
+fn derive_default<C>(
     struct_: &vkxml::Struct,
     members: &[PreprocessedMember<'_>],
     has_lifetime: bool,
-) -> Option<TokenStream> {
-    let name = name_to_tokens(&struct_.name);
-    let is_structure_type = |field: &vkxml::Field| field.basetype == "VkStructureType";
+) -> Option<TokenStream>
+where
+    C: ApiConfig + ?Sized,
+{
+    let name = C::name_to_tokens(&struct_.name);
+    let is_structure_type = |f: &vkxml::Field| f.basetype.as_str() == C::TAGGED_STRUCT.ty;
 
     // These are also pointers, and therefor also don't implement Default. The spec
     // also doesn't mark them as pointers
@@ -1790,7 +1759,7 @@ fn derive_default(
         {
             quote!(#param_ident: unsafe { ::core::mem::zeroed() })
         } else {
-            let ty = member.vkxml_field.type_tokens(false, None);
+            let ty = member.vkxml_field.type_tokens::<C>(false, None);
             quote!(#param_ident: #ty::default())
         }
     });
@@ -1813,7 +1782,10 @@ fn derive_default(
     Some(q)
 }
 
-fn derive_send_sync(struct_: &vkxml::Struct) -> Option<TokenStream> {
+fn derive_send_sync<C>(struct_: &vkxml::Struct) -> Option<TokenStream>
+where
+    C: ApiConfig + ?Sized,
+{
     if !struct_
         .elements
         .iter()
@@ -1823,7 +1795,7 @@ fn derive_send_sync(struct_: &vkxml::Struct) -> Option<TokenStream> {
         // No pointers, no need to implement Send/Sync
         return None;
     }
-    let name = name_to_tokens(&struct_.name);
+    let name = C::name_to_tokens(&struct_.name);
     let q = quote! {
         unsafe impl Send for #name <'_> {}
         unsafe impl Sync for #name <'_> {}
@@ -1831,13 +1803,16 @@ fn derive_send_sync(struct_: &vkxml::Struct) -> Option<TokenStream> {
     Some(q)
 }
 
-fn derive_debug(
+fn derive_debug<C>(
     struct_: &vkxml::Struct,
     members: &[PreprocessedMember<'_>],
     union_types: &HashSet<&str>,
     has_lifetime: bool,
-) -> Option<TokenStream> {
-    let name = name_to_tokens(&struct_.name);
+) -> Option<TokenStream>
+where
+    C: ApiConfig + ?Sized,
+{
+    let name = C::name_to_tokens(&struct_.name);
     let contains_pfn = members.iter().any(|member| {
         member
             .vkxml_field
@@ -1898,46 +1873,43 @@ fn derive_debug(
     Some(q)
 }
 
-fn derive_getters_and_setters(
+fn derive_getters_and_setters<C>(
     struct_: &vkxml::Struct,
     members: &[PreprocessedMember<'_>],
     root_structs: &HashSet<Ident>,
     has_lifetimes: &HashSet<Ident>,
-) -> Option<TokenStream> {
-    if &struct_.name == "VkBaseInStructure"
-        || &struct_.name == "VkBaseOutStructure"
-        || &struct_.name == "VkTransformMatrixKHR"
-        || &struct_.name == "VkAccelerationStructureInstanceKHR"
-    {
+) -> Option<TokenStream>
+where
+    C: ApiConfig + ?Sized,
+{
+    if !C::generate_accessors(&struct_.name) {
         return None;
     }
 
-    let name = name_to_tokens(&struct_.name);
+    let name = C::name_to_tokens(&struct_.name);
 
-    let next_field = members
-        .iter()
-        .find(|member| member.vkxml_field.param_ident() == "p_next");
+    let tag_info = TaggedStructInfo::get::<C>(members);
+    // TODO: try to use better info than the field names since openxr names them less uniquely
+    // let next_field = members
+    //     .iter()
+    //     .find(|member| &member.vkxml_field.param_ident() == C::TAGGED_STRUCT.next_name);
 
-    let structure_type_field = members
-        .iter()
-        .find(|member| member.vkxml_field.param_ident() == "s_type");
+    // let structure_type_field = members
+    //     .iter()
+    //     .find(|member| &member.vkxml_field.param_ident() == C::TAGGED_STRUCT.ty_name);
 
-    // Must either have both, or none:
-    assert_eq!(next_field.is_some(), structure_type_field.is_some());
+    // // Must either have both, or none:
+    // if next_field.is_some() != structure_type_field.is_some() {
+    //     panic!(
+    //         "invalid half-tagged struct: {}\nnext_field: {:?}\nstructure_type_field: {:?}",
+    //         &struct_.name, &next_field, &structure_type_field
+    //     );
+    // }
+    // assert_eq!(next_field.is_some(), structure_type_field.is_some());
 
-    let allowed_count_members = [
-        // pViewports is allowed to be empty if the viewport state is empty
-        ("VkPipelineViewportStateCreateInfo", "viewportCount"),
-        // Must match viewportCount
-        ("VkPipelineViewportStateCreateInfo", "scissorCount"),
-        // descriptorCount is settable regardless of having pImmutableSamplers
-        ("VkDescriptorSetLayoutBinding", "descriptorCount"),
-        // No ImageView attachments when VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT is set
-        ("VkFramebufferCreateInfo", "attachmentCount"),
-        // descriptorCount also describes descriptor length in pNext extension structures
-        // https://github.com/ash-rs/ash/issues/806
-        ("VkWriteDescriptorSet", "descriptorCount"),
-    ];
+    // TODO: review logic and fix theirs
+    // use ApiConfig::member_separate_count
+    let allowed_count_members = &[];
     let skip_members = members
         .iter()
         .filter_map(|member| {
@@ -1976,16 +1948,23 @@ fn derive_getters_and_setters(
         if skip_members.contains(&name) {
             return None;
         }
+        if tag_info.as_ref().into_iter()
+            .flat_map(|v| [v.type_field, v.next_field])
+            .filter_map(|v| v.vk_parse_type_member.name())
+            .any(|n| n == name) {
+            return None;
+        }
 
         let deprecated = member.deprecated.as_ref().map(|d| quote!(#d #[allow(deprecated)]));
         let param_ident = field.param_ident();
         let mut type_lifetime = has_lifetimes
-            .contains(&name_to_tokens(&field.basetype))
+            .contains(&C::name_to_tokens(&field.basetype))
             .then(|| quote!(<'a>));
-        let param_ty_tokens = field.safe_type_tokens(quote!('a), type_lifetime.clone(), None);
+        let param_ty_tokens = field.safe_type_tokens::<C>(quote!('a), type_lifetime.clone(), None);
 
         let param_ident_string = param_ident.to_string();
-        if param_ident_string == "s_type" || param_ident_string == "p_next" {
+        if param_ident_string == C::TAGGED_STRUCT.next_name
+            || param_ident_string == C::TAGGED_STRUCT.ty_name {
             return None;
         }
 
@@ -2032,29 +2011,27 @@ fn derive_getters_and_setters(
 
         if field.basetype == "char" {
             let param_ident_as_c_str = format_ident!("{}_as_c_str", param_ident_short);
-            if matches!(field.reference, Some(vkxml::ReferenceType::Pointer)) {
-                assert!(field.null_terminate);
-                assert_eq!(field.size, None);
-                return Some(quote! {
-                    #deprecated
-                    #[inline]
-                    pub fn #param_ident_short(mut self, #param_ident_short: &'a CStr) -> Self {
-                        self.#param_ident = #param_ident_short.as_ptr();
-                        self
-                    }
-                    #deprecated
-                    #[inline]
-                    pub unsafe fn #param_ident_as_c_str(&self) -> Option<&CStr> {
-                        if self.#param_ident.is_null() {
-                            None
-                        } else {
-                            Some(CStr::from_ptr(self.#param_ident))
+            let ret = match field {
+                vkxml::Field { reference: Some(vkxml::ReferenceType::Pointer), null_terminate: true, size: None, .. } => {
+                    return Some(quote! {
+                        #deprecated
+                        #[inline]
+                        pub fn #param_ident_short(mut self, #param_ident_short: &'a CStr) -> Self {
+                            self.#param_ident = #param_ident_short.as_ptr();
+                            self
                         }
-                    }
-                });
-            } else if is_static_array(field) {
-                assert_eq!(field.size, None);
-                return Some(quote! {
+                        #deprecated
+                        #[inline]
+                        pub unsafe fn #param_ident_as_c_str(&self) -> Option<&CStr> {
+                            if self.#param_ident.is_null() {
+                                None
+                            } else {
+                                Some(CStr::from_ptr(self.#param_ident))
+                            }
+                        }
+                    })
+                },
+                f if is_static_array(f) && f.size.is_none() => Some(quote! {
                     #deprecated
                     #[inline]
                     pub fn #param_ident_short(mut self, #param_ident_short: &CStr) -> core::result::Result<Self, CStrTooLargeForStaticArray> {
@@ -2065,7 +2042,14 @@ fn derive_getters_and_setters(
                     pub fn #param_ident_as_c_str(&self) -> core::result::Result<&CStr, FromBytesUntilNulError> {
                         wrap_c_str_slice_until_nul(&self.#param_ident)
                     }
-                });
+                }),
+                f => {
+                    warn!("failed to generate accessor methods for field: {:?}", f);
+                    None
+                },
+            };
+            if ret.is_some() {
+                return ret;
             }
         }
 
@@ -2084,7 +2068,7 @@ fn derive_getters_and_setters(
                     quote!(.as_mut_ptr())
                 };
 
-                let mut slice_param_ty_tokens = field.safe_type_tokens(quote!('a), type_lifetime.clone(), None);
+                let mut slice_param_ty_tokens = field.safe_type_tokens::<C>(quote!('a), type_lifetime.clone(), None);
 
                 // vkxml considers static arrays with len= to be Dynamic (which they are to some
                 // extent). These fields have a static upper-bound length, and a runtime field to
@@ -2123,8 +2107,8 @@ fn derive_getters_and_setters(
                 let set_size_stmt = if field.is_pointer_to_static_sized_array() {
                     // this is a pointer to a piece of memory with statically known size.
                     let array_size = field.c_size.as_ref().unwrap();
-                    let c_size = convert_c_expression(array_size, &BTreeMap::new());
-                    let inner_type = field.inner_type_tokens(None, None);
+                    let c_size = convert_c_expression::<C>(array_size, &BTreeMap::new());
+                    let inner_type = field.inner_type_tokens::<C>(None, None);
 
                     slice_param_ty_tokens = quote!([#inner_type; #c_size]);
                     ptr = quote!();
@@ -2134,7 +2118,7 @@ fn derive_getters_and_setters(
                     // Deal with a "special" 2D dynamic array with an inner size of 1 (effectively an array containing pointers to single objects)
                     let array_size = if let Some(array_size) = array_size.strip_suffix(",1") {
                         param_ident_short = format_ident!("{}_ptrs", param_ident_short);
-                        slice_param_ty_tokens = field.safe_type_tokens(quote!('a), type_lifetime.clone(), Some(1));
+                        slice_param_ty_tokens = field.safe_type_tokens::<C>(quote!('a), type_lifetime.clone(), Some(1));
                         ptr = quote!(#ptr.cast());
                         array_size
                     } else {
@@ -2168,7 +2152,7 @@ fn derive_getters_and_setters(
             }
         }
 
-        if field.basetype == "VkBool32" {
+        if C::strip_type_prefix(field.basetype.as_str()) == Some("Bool32") {
             return Some(quote!{
                 #deprecated
                 #[inline]
@@ -2204,7 +2188,7 @@ fn derive_getters_and_setters(
 
         let param_ty_tokens = if is_opaque_type(&field.basetype) {
             //  Use raw pointers for void/opaque types
-            field.type_tokens(false, type_lifetime)
+            field.type_tokens::<C>(false, type_lifetime)
         } else {
             param_ty_tokens
         };
@@ -2222,7 +2206,9 @@ fn derive_getters_and_setters(
     let extends_name = format_ident!("Extends{}", name);
 
     // The `p_next` field should only be considered if this struct is also a root struct
-    let root_struct_next_field = next_field.filter(|_| root_structs.contains(&name));
+    let root_struct_next_field = tag_info.as_ref()
+        .map(|v| v.next_field)
+        .filter(|_| root_structs.contains(&name));
 
     // We only implement a next method for root structs with a `pnext` field.
     let next_function = if let Some(next_member) = root_struct_next_field {
@@ -2277,31 +2263,36 @@ fn derive_getters_and_setters(
         .extends
         .iter()
         .flat_map(|extends| extends.split(','))
-        .map(|extends| format_ident!("Extends{}", name_to_tokens(extends)))
+        .map(|extends| format_ident!("Extends{}", C::name_to_tokens(extends)))
         .map(|extends| {
             // Extension structs always have a pNext, and therefore always have a lifetime.
             quote!(unsafe impl #extends for #name<'_> {})
         });
 
-    let impl_structure_type_trait = structure_type_field.map(|member| {
-        let value = member
-            .vkxml_field
-            .type_enums
-            .as_deref()
-            .expect("s_type field must have a value in `vk.xml`");
+    let impl_structure_type_trait = tag_info.as_ref().into_iter()
+        .flat_map(|TaggedStructInfo { type_field: member, .. }| -> Option<TokenStream> {
+            let struct_name = &struct_.name;
+            let m_field = &member.vkxml_field;
+            let value = member
+                .vkxml_field
+                .type_enums
+                .as_deref()?;
+                // .unwrap_or_else(|| {
+                //     panic!("{struct_name} -> {m_field:?} did not have an entry value in xml");
+                // });
 
-        assert!(!value.contains(','));
+            assert!(!value.contains(','));
 
-        let value = variant_ident("VkStructureType", value);
-        quote! {
-            unsafe impl #lifetime TaggedStructure for #name #lifetime {
-                const STRUCTURE_TYPE: StructureType = StructureType::#value;
-            }
-        }
-    });
+            let value = variant_ident::<C>(C::TAGGED_STRUCT.ty, value);
+            Some(quote! {
+                unsafe impl #lifetime TaggedStructure for #name #lifetime {
+                    const STRUCTURE_TYPE: StructureType = StructureType::#value;
+                }
+            })
+        });
 
     let q = quote! {
-        #impl_structure_type_trait
+        #(#impl_structure_type_trait)*
         #(#impl_extend_trait)*
         #next_trait
 
@@ -2315,101 +2306,31 @@ fn derive_getters_and_setters(
     Some(q)
 }
 
-/// At the moment `Ash` doesn't properly derive all the necessary drives
-/// like Eq, Hash etc.
-/// To Address some cases, you can add the name of the struct that you
-/// require and add the missing derives yourself.
-pub fn manual_derives(struct_: &vkxml::Struct) -> TokenStream {
-    match struct_.name.as_str() {
-        "VkClearRect" | "VkExtent2D" | "VkExtent3D" | "VkOffset2D" | "VkOffset3D" | "VkRect2D"
-        | "VkSurfaceFormatKHR" => quote! {PartialEq, Eq, Hash,},
-        _ => quote! {},
-    }
-}
-
-struct PreprocessedMember<'a> {
+#[derive(Debug)]
+pub(crate) struct PreprocessedMember<'a> {
     vkxml_field: &'a vkxml::Field,
     vk_parse_type_member: &'a vk_parse::TypeMemberDefinition,
     deprecated: Option<TokenStream>,
 }
 
-pub fn generate_struct(
+pub fn generate_struct<C>(
     struct_: &vkxml::Struct,
     vk_parse_types: &HashMap<String, &vk_parse::Type>,
     root_structs: &HashSet<Ident>,
     union_types: &HashSet<&str>,
     has_lifetimes: &HashSet<Ident>,
-) -> TokenStream {
-    let name = name_to_tokens(&struct_.name);
+) -> TokenStream
+where
+    C: ApiConfig + ?Sized,
+{
+    let name = C::name_to_tokens(&struct_.name);
     let vk_parse_struct = vk_parse_types[&struct_.name];
     let vk_parse::TypeSpec::Members(vk_parse_members) = &vk_parse_struct.spec else {
         panic!()
     };
 
-    if &struct_.name == "VkTransformMatrixKHR" {
-        return quote! {
-            #[repr(C)]
-            #[derive(Copy, Clone)]
-            pub struct TransformMatrixKHR {
-                pub matrix: [f32; 12],
-            }
-        };
-    }
-
-    if &struct_.name == "VkAccelerationStructureInstanceKHR" {
-        return quote! {
-            #[repr(C)]
-            #[derive(Copy, Clone)]
-            pub union AccelerationStructureReferenceKHR {
-                pub device_handle: DeviceAddress,
-                pub host_handle: AccelerationStructureKHR,
-            }
-            #[repr(C)]
-            #[derive(Copy, Clone)]
-            #[doc = "<https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkAccelerationStructureInstanceKHR.html>"]
-            pub struct AccelerationStructureInstanceKHR {
-                pub transform: TransformMatrixKHR,
-                /// Use [`Packed24_8::new(instance_custom_index, mask)`][Packed24_8::new()] to construct this field
-                pub instance_custom_index_and_mask: Packed24_8,
-                /// Use [`Packed24_8::new(instance_shader_binding_table_record_offset, flags)`][Packed24_8::new()] to construct this field
-                pub instance_shader_binding_table_record_offset_and_flags: Packed24_8,
-                pub acceleration_structure_reference: AccelerationStructureReferenceKHR,
-            }
-        };
-    }
-
-    if &struct_.name == "VkAccelerationStructureSRTMotionInstanceNV" {
-        return quote! {
-            #[repr(C)]
-            #[derive(Copy, Clone)]
-            #[doc = "<https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkAccelerationStructureSRTMotionInstanceNV.html>"]
-            pub struct AccelerationStructureSRTMotionInstanceNV {
-                pub transform_t0: SRTDataNV,
-                pub transform_t1: SRTDataNV,
-                /// Use [`Packed24_8::new(instance_custom_index, mask)`][Packed24_8::new()] to construct this field
-                pub instance_custom_index_and_mask: Packed24_8,
-                /// Use [`Packed24_8::new(instance_shader_binding_table_record_offset, flags)`][Packed24_8::new()] to construct this field
-                pub instance_shader_binding_table_record_offset_and_flags: Packed24_8,
-                pub acceleration_structure_reference: AccelerationStructureReferenceKHR,
-            }
-        };
-    }
-
-    if &struct_.name == "VkAccelerationStructureMatrixMotionInstanceNV" {
-        return quote! {
-            #[repr(C)]
-            #[derive(Copy, Clone)]
-            #[doc = "<https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/AccelerationStructureMatrixMotionInstanceNV.html>"]
-            pub struct AccelerationStructureMatrixMotionInstanceNV {
-                pub transform_t0: TransformMatrixKHR,
-                pub transform_t1: TransformMatrixKHR,
-                /// Use [`Packed24_8::new(instance_custom_index, mask)`][Packed24_8::new()] to construct this field
-                pub instance_custom_index_and_mask: Packed24_8,
-                /// Use [`Packed24_8::new(instance_shader_binding_table_record_offset, flags)`][Packed24_8::new()] to construct this field
-                pub instance_shader_binding_table_record_offset_and_flags: Packed24_8,
-                pub acceleration_structure_reference: AccelerationStructureReferenceKHR,
-            }
-        };
+    if let Some(ret) = C::manual_struct(&struct_.name) {
+        return ret;
     }
 
     let members = struct_
@@ -2422,7 +2343,8 @@ pub fn generate_struct(
                 .filter_map(get_variant!(vk_parse::TypeMember::Definition)),
         )
         .filter(|(_, vk_parse_field)| {
-            matches!(vk_parse_field.api.as_deref(), None | Some(DESIRED_API))
+            let v = vk_parse_field.api.as_deref();
+            v.is_none() || v == Some(C::NAME)
         })
         .map(|(field, vk_parse_field)| {
             let deprecated = vk_parse_field
@@ -2455,9 +2377,9 @@ pub fn generate_struct(
             quote!(#pointer Self)
         } else {
             let type_lifetime = has_lifetimes
-                .contains(&name_to_tokens(&field.basetype))
+                .contains(&C::name_to_tokens(&field.basetype))
                 .then(|| quote!(<'a>));
-            field.type_tokens(false, type_lifetime)
+            field.type_tokens::<C>(false, type_lifetime)
         };
 
         quote!(#deprecated pub #param_ident: #param_ty_tokens)
@@ -2469,26 +2391,31 @@ pub fn generate_struct(
         false => (quote!(), quote!()),
     };
 
-    let debug_tokens = derive_debug(struct_, &members, union_types, has_lifetime);
-    let default_tokens = derive_default(struct_, &members, has_lifetime);
-    let send_sync_tokens = derive_send_sync(struct_);
-    let setter_tokens = derive_getters_and_setters(struct_, &members, root_structs, has_lifetimes);
-    let manual_derive_tokens = manual_derives(struct_);
+    let debug_tokens = derive_debug::<C>(struct_, &members, union_types, has_lifetime);
+    let default_tokens = derive_default::<C>(struct_, &members, has_lifetime);
+    let send_sync_tokens = derive_send_sync::<C>(struct_);
+    let setter_tokens = derive_getters_and_setters::<C>(struct_, &members, root_structs, has_lifetimes);
+    let manual_derive_tokens = C::manual_derives(&struct_.name);
     let dbg_str = if debug_tokens.is_none() {
         quote!(#[cfg_attr(feature = "debug", derive(Debug))])
     } else {
         quote!()
     };
     let default_str = if default_tokens.is_none() {
-        quote!(Default,)
+        Some(quote!(Default))
     } else {
-        quote!()
+        None
     };
     let khronos_link = khronos_link(&struct_.name);
+    let derives = [
+        Some(quote!(Copy, Clone)),
+        default_str,
+        manual_derive_tokens,
+    ].into_iter().flatten();
     quote! {
         #[repr(C)]
         #dbg_str
-        #[derive(Copy, Clone, #default_str #manual_derive_tokens)]
+        #[derive( #( #derives ),* )]
         #[doc = #khronos_link]
         #[must_use]
         pub struct #name #lifetimes {
@@ -2502,14 +2429,17 @@ pub fn generate_struct(
     }
 }
 
-pub fn generate_handle(handle: &vkxml::Handle) -> Option<TokenStream> {
+pub fn generate_handle<C>(handle: &vkxml::Handle) -> Option<TokenStream>
+where
+    C: ApiConfig + ?Sized,
+{
     if handle.name.is_empty() {
         return None;
     }
     let khronos_link = khronos_link(&handle.name);
     let tokens = match handle.ty {
         vkxml::HandleType::Dispatch => {
-            let name = handle.name.strip_prefix("Vk").unwrap();
+            let name = C::strip_type_prefix(handle.name.as_ref()).unwrap();
             let ty = format_ident!("{}", name.to_shouty_snake_case());
             let name = format_ident!("{}", name);
             quote! {
@@ -2517,7 +2447,7 @@ pub fn generate_handle(handle: &vkxml::Handle) -> Option<TokenStream> {
             }
         }
         vkxml::HandleType::NoDispatch => {
-            let name = handle.name.strip_prefix("Vk").unwrap();
+            let name = C::strip_type_prefix(handle.name.as_ref()).unwrap();
             let ty = format_ident!("{}", name.to_shouty_snake_case());
             let name = format_ident!("{}", name);
             quote! {
@@ -2527,20 +2457,26 @@ pub fn generate_handle(handle: &vkxml::Handle) -> Option<TokenStream> {
     };
     Some(tokens)
 }
-fn generate_funcptr(fnptr: &vkxml::FunctionPointer, has_lifetimes: &HashSet<Ident>) -> TokenStream {
+fn generate_funcptr<C>(
+    fnptr: &vkxml::FunctionPointer,
+    has_lifetimes: &HashSet<Ident>
+) -> TokenStream
+where
+    C: ApiConfig + ?Sized,
+{
     let name = format_ident!("{}", fnptr.name);
     let ret_ty_tokens = if fnptr.return_type.is_void() {
         quote!()
     } else {
-        let ret_ty_tokens = fnptr.return_type.type_tokens(true, None);
+        let ret_ty_tokens = fnptr.return_type.type_tokens::<C>(true, None);
         quote!(-> #ret_ty_tokens)
     };
     let params = fnptr.param.iter().map(|field| {
         let ident = field.param_ident();
         let type_lifetime = has_lifetimes
-            .contains(&name_to_tokens(&field.basetype))
+            .contains(&C::name_to_tokens(&field.basetype))
             .then(|| quote!(<'_>));
-        let type_tokens = field.type_tokens(true, type_lifetime);
+        let type_tokens = field.type_tokens::<C>(true, type_lifetime);
         quote! {
             #ident: #type_tokens
         }
@@ -2553,14 +2489,20 @@ fn generate_funcptr(fnptr: &vkxml::FunctionPointer, has_lifetimes: &HashSet<Iden
     }
 }
 
-fn generate_union(union: &vkxml::Union, has_lifetimes: &HashSet<Ident>) -> TokenStream {
-    let name = name_to_tokens(&union.name);
+fn generate_union<C>(
+    union: &vkxml::Union,
+    has_lifetimes: &HashSet<Ident>
+) -> TokenStream
+where
+    C: ApiConfig + ?Sized,
+{
+    let name = C::name_to_tokens(&union.name);
     let fields = union.elements.iter().map(|field| {
         let name = field.param_ident();
         let type_lifetime = has_lifetimes
-            .contains(&name_to_tokens(&field.basetype))
+            .contains(&C::name_to_tokens(&field.basetype))
             .then(|| quote!(<'a>));
-        let ty = field.type_tokens(false, type_lifetime);
+        let ty = field.type_tokens::<C>(false, type_lifetime);
         quote! {
             pub #name: #ty
         }
@@ -2583,10 +2525,13 @@ fn generate_union(union: &vkxml::Union, has_lifetimes: &HashSet<Ident>) -> Token
     }
 }
 /// Root structs are all structs that are extended by other structs.
-pub fn root_structs(
+pub fn root_structs<C>(
     definitions: &[&vk_parse::Type],
     allowed_types: &HashSet<&str>,
-) -> HashSet<Ident> {
+) -> HashSet<Ident>
+where
+    C: ApiConfig + ?Sized,
+{
     // Loop over all structs and collect their extends
     definitions
         .iter()
@@ -2594,26 +2539,26 @@ pub fn root_structs(
             type_
                 .name
                 .as_ref()
-                .map_or(false, |name| allowed_types.contains(name.as_str()))
+                .map_or(false, |name| C::IGNORE_REQUIRED || allowed_types.contains(name.as_str()))
         })
         .filter_map(|type_| type_.structextends.as_ref())
         .flat_map(|e| e.split(','))
-        .map(name_to_tokens)
+        .map(|v| C::name_to_tokens(v))
         .collect()
 }
-pub fn generate_definition_vk_parse(
+pub fn generate_definition_vk_parse<C: ApiConfig + ?Sized>(
     definition: &vk_parse::Type,
     allowed_types: &HashSet<&str>,
     identifier_renames: &mut BTreeMap<String, Ident>,
 ) -> Option<TokenStream> {
     if let Some(api) = &definition.api {
-        if api != DESIRED_API {
+        if api != C::NAME {
             return None;
         }
     }
 
     match definition.category.as_deref() {
-        Some("define") => Some(generate_define(
+        Some("define") => Some(generate_define::<C>(
             definition,
             allowed_types,
             identifier_renames,
@@ -2622,7 +2567,7 @@ pub fn generate_definition_vk_parse(
     }
 }
 #[allow(clippy::too_many_arguments)]
-pub fn generate_definition(
+pub fn generate_definition<C>(
     definition: &vkxml::DefinitionsElement,
     allowed_types: &HashSet<&str>,
     union_types: &HashSet<&str>,
@@ -2631,17 +2576,23 @@ pub fn generate_definition(
     vk_parse_types: &HashMap<String, &vk_parse::Type>,
     bitflags_cache: &mut HashSet<Ident>,
     const_values: &mut BTreeMap<Ident, ConstantTypeInfo>,
-) -> Option<TokenStream> {
+) -> Option<TokenStream>
+where
+    C: ApiConfig + ?Sized,
+{
+    let type_allowed = move |name: &str| {
+        C::IGNORE_REQUIRED || allowed_types.contains(name)
+    };
     match *definition {
         vkxml::DefinitionsElement::Typedef(ref typedef)
-            if allowed_types.contains(typedef.name.as_str()) =>
+            if type_allowed(typedef.name.as_str()) =>
         {
-            Some(generate_typedef(typedef))
+            Some(generate_typedef::<C>(typedef))
         }
         vkxml::DefinitionsElement::Struct(ref struct_)
-            if allowed_types.contains(struct_.name.as_str()) =>
+            if type_allowed(struct_.name.as_str()) =>
         {
-            Some(generate_struct(
+            Some(generate_struct::<C>(
                 struct_,
                 vk_parse_types,
                 root_structs,
@@ -2650,33 +2601,36 @@ pub fn generate_definition(
             ))
         }
         vkxml::DefinitionsElement::Bitmask(ref mask)
-            if allowed_types.contains(mask.name.as_str()) =>
+            if type_allowed(mask.name.as_str()) =>
         {
-            generate_bitmask(mask, bitflags_cache, const_values)
+            generate_bitmask::<C>(mask, bitflags_cache, const_values)
         }
         vkxml::DefinitionsElement::Handle(ref handle)
-            if allowed_types.contains(handle.name.as_str()) =>
+            if type_allowed(handle.name.as_str()) =>
         {
-            generate_handle(handle)
+            generate_handle::<C>(handle)
         }
-        vkxml::DefinitionsElement::FuncPtr(ref fp) if allowed_types.contains(fp.name.as_str()) => {
-            Some(generate_funcptr(fp, has_lifetimes))
+        vkxml::DefinitionsElement::FuncPtr(ref fp) if type_allowed(fp.name.as_str()) => {
+            Some(generate_funcptr::<C>(fp, has_lifetimes))
         }
         vkxml::DefinitionsElement::Union(ref union)
-            if allowed_types.contains(union.name.as_str()) =>
+            if type_allowed(union.name.as_str()) =>
         {
-            Some(generate_union(union, has_lifetimes))
+            Some(generate_union::<C>(union, has_lifetimes))
         }
         _ => None,
     }
 }
-pub fn generate_feature<'a>(
+pub fn generate_feature<'a, C>(
     feature: &vkxml::Feature,
     commands: &CommandMap<'a>,
     fn_cache: &mut HashMap<&'a str, (Ident, Ident)>,
     has_lifetimes: &HashSet<Ident>,
-) -> TokenStream {
-    if !contains_desired_api(&feature.api) {
+) -> TokenStream
+where
+    C: ApiConfig + ?Sized,
+{
+    if !C::contains_desired_api(&feature.api) {
         return quote!();
     }
 
@@ -2690,11 +2644,13 @@ pub fn generate_feature<'a>(
         .fold(
             (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
             |mut accs, &cmd_ref| {
-                let acc = match cmd_ref.function_type() {
-                    FunctionType::Static => &mut accs.0,
-                    FunctionType::Entry => &mut accs.1,
-                    FunctionType::Device => &mut accs.2,
-                    FunctionType::Instance => &mut accs.3,
+                let acc = match C::function_type(cmd_ref) {
+                    config::FunctionType::Static => &mut accs.0,
+                    config::FunctionType::Entry => &mut accs.1,
+                    config::FunctionType::Dispatched("Device") => &mut accs.2,
+                    config::FunctionType::Dispatched("Instance") => &mut accs.3,
+                    config::FunctionType::Dispatched(ty) =>
+                        panic!("invalid function dispatch type: {}", ty),
                 };
                 acc.push(cmd_ref);
                 accs
@@ -2702,7 +2658,7 @@ pub fn generate_feature<'a>(
         );
     let version = feature.version_string();
     let static_fn = if feature.is_version(1, 0) {
-        generate_function_pointers(
+        generate_function_pointers::<C>(
             format_ident!("{}", "StaticFn"),
             None,
             &static_commands,
@@ -2713,7 +2669,7 @@ pub fn generate_feature<'a>(
     } else {
         quote! {}
     };
-    let entry = generate_function_pointers(
+    let entry = generate_function_pointers::<C>(
         format_ident!("EntryFnV{}", version),
         None,
         &entry_commands,
@@ -2721,7 +2677,7 @@ pub fn generate_feature<'a>(
         fn_cache,
         has_lifetimes,
     );
-    let instance = generate_function_pointers(
+    let instance = generate_function_pointers::<C>(
         format_ident!("InstanceFnV{}", version),
         None,
         &instance_commands,
@@ -2729,7 +2685,7 @@ pub fn generate_feature<'a>(
         fn_cache,
         has_lifetimes,
     );
-    let device = generate_function_pointers(
+    let device = generate_function_pointers::<C>(
         format_ident!("DeviceFnV{}", version),
         None,
         &device_commands,
@@ -2745,24 +2701,19 @@ pub fn generate_feature<'a>(
     }
 }
 
-pub fn constant_name(name: &str) -> &str {
-    name.strip_prefix("VK_").unwrap_or(name)
-}
-
-pub fn generate_constant<'a>(
+pub fn generate_constant<'a, C: ApiConfig + ?Sized>(
     constant: &'a vkxml::Constant,
     cache: &mut HashSet<&'a str>,
 ) -> TokenStream {
     cache.insert(constant.name.as_str());
     let c = Constant::from_constant(constant);
-    let name = constant_name(&constant.name);
+    let name = C::strip_constant_prefix(&constant.name).unwrap_or(constant.name.as_str());
     let ident = format_ident!("{}", name);
     let notation = constant.doc_attribute();
 
-    let ty = if name == "TRUE" || name == "FALSE" {
-        CType::Bool32
-    } else {
-        c.ty()
+    let ty = match name {
+        "TRUE" | "FALSE" => CType::Bool32,
+        _ => c.ty(),
     };
     quote! {
         #notation
@@ -2770,7 +2721,7 @@ pub fn generate_constant<'a>(
     }
 }
 
-pub fn generate_feature_extension<'a>(
+pub fn generate_feature_extension<'a, C: ApiConfig + ?Sized>(
     registry: &'a vk_parse::Registry,
     const_cache: &mut HashSet<&'a str>,
     const_values: &mut BTreeMap<Ident, ConstantTypeInfo>,
@@ -2779,9 +2730,9 @@ pub fn generate_feature_extension<'a>(
         .0
         .iter()
         .filter_map(get_variant!(vk_parse::RegistryChild::Feature))
-        .filter(|feature| contains_desired_api(&feature.api))
+        .filter(|feature| C::contains_desired_api(&feature.api))
         .map(|feature| {
-            generate_extension_constants(
+            generate_extension_constants::<C>(
                 &feature.name,
                 0,
                 &feature.children,
@@ -2930,27 +2881,30 @@ pub fn extract_native_types(registry: &vk_parse::Registry) -> (Vec<(String, Stri
 
     (header_includes, header_types)
 }
-pub fn generate_aliases_of_types(
+pub fn generate_aliases_of_types<C>(
     types: &vk_parse::Types,
     allowed_types: &HashSet<&str>,
     has_lifetimes: &HashSet<Ident>,
     ty_cache: &mut HashSet<Ident>,
-) -> TokenStream {
+) -> TokenStream
+where
+    C: ApiConfig + ?Sized,
+{
     let aliases = types
         .children
         .iter()
         .filter_map(get_variant!(vk_parse::TypesChild::Type))
         .filter_map(|ty| {
             let name = ty.name.as_ref()?;
-            if !allowed_types.contains(name.as_str()) {
+            if !allowed_types.contains(name.as_str()) || C::IGNORE_REQUIRED {
                 return None;
             }
             let alias = ty.alias.as_ref()?;
-            let name_ident = name_to_tokens(name);
+            let name_ident = C::name_to_tokens(name);
             if !ty_cache.insert(name_ident.clone()) {
                 return None;
             };
-            let alias_ident = name_to_tokens(alias);
+            let alias_ident = C::name_to_tokens(alias);
             let tokens = if has_lifetimes.contains(&alias_ident) {
                 quote!(pub type #name_ident<'a> = #alias_ident<'a>;)
             } else {
@@ -2962,21 +2916,119 @@ pub fn generate_aliases_of_types(
         #(#aliases)*
     }
 }
-pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
-    let vk_xml = vk_headers_dir.join("registry/vk.xml");
+
+#[derive(Debug)]
+#[repr(transparent)]
+struct Tags<'a> {
+    names: HashSet<&'a str>,
+}
+
+impl<'a> Tags<'a> {
+    fn from_registry(spec: &'a vk_parse::Registry) -> Self {
+        let names = spec.0.iter()
+            .filter_map(|v| match v {
+                vk_parse::RegistryChild::Tags(v) => Some(v),
+                _ => None,
+            })
+            .flat_map(|v| &v.children)
+            .map(|vk_parse::Tag { name, .. }| name.as_str());
+        Tags {
+            names: names.collect(),
+        }
+    }
+
+    #[inline(always)]
+    fn iter<'t>(&'t self) -> impl Iterator<Item=&'a str> + 't {
+        self.names.iter().copied()
+    }
+
+    #[inline(always)]
+    fn strip_suffix<'s>(&self, name: &'s str) -> (&'a str, &'s str)
+    where
+        'a: 's,
+    {
+        self.iter()
+            .filter_map(|vendor| name.strip_vendor_suffix(vendor).map(move |n| (vendor, n)))
+            .max_by_key(|(vendor, ..)| vendor.len())
+            .unwrap_or(("", name))
+    }
+
+    // pub fn variant_ident<C>(&self, enum_name: &str, variant_name: &str) -> Ident
+    // where
+    //     C: ApiConfig + ?Sized,
+    // {
+    //     static_regex! {
+    //         TRAILING_NUMBER = r"(\d+)$",
+    //         LEADING_NUMBER = r"^\d",
+    //     }
+    //     let (vendor, struct_name) = C::variant_prefix(enum_name)
+    //         .map_or_else(|| {
+    //             let struct_name = enum_name.strip_bits_suffix();
+    //             let struct_name = struct_name.to_shouty_snake_case();
+    //             let (vendor, struct_name) = self.strip_suffix(struct_name.as_str());
+    //             let struct_name = TRAILING_NUMBER.replace(struct_name, "_$1");
+    //             (vendor, struct_name.into_owned())
+    //         }, |s| ("", s.to_string()));
+
+    //     let variant_name = variant_name.to_uppercase();
+    //     let variant_name = variant_name.strip_suffix(vendor).unwrap_or(&variant_name);
+    //     let variant_name = variant_name
+    //         .strip_prefix(&*struct_name)
+    //         .unwrap_or_else(|| {
+    //             if C::RESULT_ENUM.ty == enum_name {
+    //                 variant_name.strip_prefix(C::result_variant_prefix())
+    //                     .expect("failed to strip result prefix from enum variant")
+    //             } else {
+    //                 panic!("Failed to strip {struct_name} prefix from enum variant {variant_name}")
+    //             }
+    //         });
+
+    //     // Both of the above strip_prefix leave a leading `_`:
+    //     let variant_name = variant_name.strip_prefix('_').unwrap_or_else(|| {
+    //         panic!("Failed to strip {struct_name}'s variant {variant_name}'s underscore prefix");
+    //     });
+    //     // Replace _BIT anywhere in the string, also works when there's a trailing
+    //     // vendor extension in the variant name that's not in the enum/type name:
+    //     let variant_name = variant_name.replace("_BIT", "");
+    //     if LEADING_NUMBER.is_match_at(variant_name.as_ref(), 0) {
+    //         format_ident!("TYPE_{}", variant_name)
+    //     } else {
+    //         Ident::new(&variant_name, Span::call_site())
+    //     }
+    // }
+}
+
+pub fn write_source_code<
+    P: AsRef<Path>,
+    C: ApiConfig + ?Sized,
+>(
+    vk_headers_dir: &Path,
+    src_dir: P,
+) {
+    let mut vk_xml = vk_headers_dir.to_path_buf();
+    vk_xml.extend(["registry".as_ref(), C::REGISTRY_FILENAME]);
+    info!("writing {} bindings from {}", C::NAME, vk_xml.display());
     use std::fs::File;
     use std::io::Write;
-    let (spec2, _errors) = vk_parse::parse_file(&vk_xml).expect("Invalid xml file");
+    let (spec2, warnings) = vk_parse::parse_file(&vk_xml).expect("Invalid xml file");
+    warnings.into_iter().for_each(|w| {
+        warn!("warning parsing registry: {:?}", &w);
+    });
+    #[derive(Debug, Clone, Copy, thiserror::Error)]
+    #[error("no extnsions child found in registry: {0:#?}")]
+    #[repr(transparent)]
+    struct NoExtensionsError<'a>(&'a vk_parse::Registry);
     let extensions: Vec<&vk_parse::Extension> = spec2
         .0
         .iter()
         .find_map(get_variant!(vk_parse::RegistryChild::Extensions))
-        .expect("extension")
+        // .ok_or(NoExtensionsError(&spec2))
+        .expect("failed to find extensions")
         .children
         .iter()
         .filter(|e| {
             if let Some(supported) = &e.supported {
-                contains_desired_api(supported) ||
+                C::contains_desired_api(supported) ||
                 // VK_ANDROID_native_buffer is for internal use only, but types defined elsewhere
                 // reference enum extension constants.  Exempt the extension from this check until
                 // types are properly folded in with their extension (where applicable).
@@ -2987,7 +3039,10 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         })
         .collect();
 
-    let spec = vk_parse::parse_file_as_vkxml(&vk_xml).expect("Invalid xml file.");
+    let spec = vk_parse::parse_file_as_vkxml(&vk_xml)
+        .expect("Invalid xml file.");
+
+    let _tags = Tags::from_registry(&spec2);
 
     let features: Vec<&vkxml::Feature> = spec
         .elements
@@ -3014,7 +3069,7 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         .0
         .iter()
         .filter_map(get_variant!(vk_parse::RegistryChild::Feature))
-        .filter(|feature| contains_desired_api(&feature.api))
+        .filter(|feature| C::contains_desired_api(&feature.api))
         .flat_map(|features| &features.children);
 
     let extension_children = extensions.iter().flat_map(|extension| &extension.children);
@@ -3022,7 +3077,7 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
     let (required_types, required_commands) = features_children
         .chain(extension_children)
         .filter_map(get_variant!(vk_parse::FeatureChild::Require { api, items }))
-        .filter(|(api, _items)| matches!(api.as_deref(), None | Some(DESIRED_API)))
+        .filter(|(api, _items)| api.as_deref().is_none() || api.as_deref() == Some(C::NAME))
         .flat_map(|(_api, items)| items)
         .fold((HashSet::new(), HashSet::new()), |mut acc, elem| {
             match elem {
@@ -3043,7 +3098,7 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         .filter_map(get_variant!(vk_parse::RegistryChild::Commands))
         .flat_map(|cmds| &cmds.children)
         .filter_map(get_variant!(vk_parse::Command::Definition))
-        .filter(|cmd| required_commands.contains(&cmd.proto.name.as_str()))
+        .filter(|cmd| C::IGNORE_REQUIRED || required_commands.contains(&cmd.proto.name.as_str()))
         .map(|cmd| (cmd.proto.name.clone(), cmd))
         .collect();
 
@@ -3053,7 +3108,7 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         .filter_map(get_variant!(vk_parse::RegistryChild::Commands))
         .flat_map(|cmds| &cmds.children)
         .filter_map(get_variant!(vk_parse::Command::Alias { name, alias }))
-        .filter(|(name, _alias)| required_commands.contains(name.as_str()))
+        .filter(|(name, _alias)| C::IGNORE_REQUIRED || required_commands.contains(name.as_str()))
         .map(|(name, alias)| (name.as_str(), alias.as_str()))
         .collect();
 
@@ -3068,23 +3123,23 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         .iter()
         .filter_map(get_variant!(vk_parse::RegistryChild::Enums))
         .filter(|enums| enums.kind.is_some())
-        .filter(|enums| {
+        .filter(|enums| C::IGNORE_REQUIRED || {
             enums.name.as_ref().map_or(true, |n| {
                 required_types.contains(n.replace("FlagBits", "Flags").as_str())
             })
         })
-        .map(|e| generate_enum(e, &mut const_cache, &mut const_values, &mut bitflags_cache))
+        .map(|e| generate_enum::<C>(e, &mut const_cache, &mut const_values, &mut bitflags_cache))
         .fold((Vec::new(), Vec::new()), |mut acc, elem| {
             match elem {
-                EnumType::Enum(token) => acc.0.push(token),
-                EnumType::Bitflags(token) => acc.1.push(token),
+                EnumCode::Enum(token) => acc.0.push(token),
+                EnumCode::Bitflags(token) => acc.1.push(token),
             };
             acc
         });
 
     let mut constants_code: Vec<_> = constants
         .iter()
-        .map(|constant| generate_constant(constant, &mut const_cache))
+        .map(|constant| generate_constant::<C>(constant, &mut const_cache))
         .collect();
 
     constants_code.push(quote! { pub const SHADER_UNUSED_NV : u32 = SHADER_UNUSED_KHR;});
@@ -3109,7 +3164,7 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
                 .filter_map(get_variant!(vkxml::StructElement::Member))
                 .any(|x| x.reference.is_some())
         })
-        .map(|s| name_to_tokens(&s.name))
+        .map(|s| C::name_to_tokens(&s.name))
         .collect::<HashSet<Ident>>();
     for def in &definitions {
         match def {
@@ -3117,13 +3172,13 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
                 .elements
                 .iter()
                 .filter_map(get_variant!(vkxml::StructElement::Member))
-                .any(|field| has_lifetimes.contains(&name_to_tokens(&field.basetype)))
-                .then(|| has_lifetimes.insert(name_to_tokens(&s.name))),
+                .any(|field| has_lifetimes.contains(&C::name_to_tokens(&field.basetype)))
+                .then(|| has_lifetimes.insert(C::name_to_tokens(&s.name))),
             vkxml::DefinitionsElement::Union(u) => u
                 .elements
                 .iter()
-                .any(|field| has_lifetimes.contains(&name_to_tokens(&field.basetype)))
-                .then(|| has_lifetimes.insert(name_to_tokens(&u.name))),
+                .any(|field| has_lifetimes.contains(&C::name_to_tokens(&field.basetype)))
+                .then(|| has_lifetimes.insert(C::name_to_tokens(&u.name))),
             _ => continue,
         };
     }
@@ -3135,8 +3190,8 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         .filter_map(get_variant!(vk_parse::TypesChild::Type))
     {
         if let (Some(name), Some(alias)) = (&type_.name, &type_.alias) {
-            if has_lifetimes.contains(&name_to_tokens(alias)) {
-                has_lifetimes.insert(name_to_tokens(name));
+            if has_lifetimes.contains(&C::name_to_tokens(alias)) {
+                has_lifetimes.insert(C::name_to_tokens(name));
             }
         }
     }
@@ -3144,7 +3199,7 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
     let extension_constants = extensions
         .iter()
         .map(|ext| {
-            generate_extension_constants(
+            generate_extension_constants::<C>(
                 &ext.name,
                 ext.number.unwrap_or(0),
                 &ext.children,
@@ -3156,7 +3211,7 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
 
     let mut extension_cmds = BTreeMap::<&str, Vec<TokenStream>>::new();
     for ext in extensions.iter() {
-        let (vendor, code) = generate_extension_commands(
+        let (vendor, code) = generate_extension_commands::<C>(
             &ext.name,
             &ext.children,
             &commands,
@@ -3188,11 +3243,12 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
     let vk_parse_definitions: Vec<_> = vk_parse_types
         .iter()
         .filter_map(|def| {
-            generate_definition_vk_parse(def, &required_types, &mut identifier_renames)
+            generate_definition_vk_parse::<C>(def, &required_types, &mut identifier_renames)
         })
         .collect();
 
-    let root_structs = root_structs(&vk_parse_types, &required_types);
+    let root_structs = root_structs::<C>(&vk_parse_types, &required_types);
+    debug!("root_structs: {:#?}", &root_structs);
 
     let vk_parse_types = vk_parse_types
         .into_iter()
@@ -3201,7 +3257,7 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
     let definition_code: Vec<_> = vk_parse_definitions
         .into_iter()
         .chain(definitions.into_iter().filter_map(|def| {
-            generate_definition(
+            generate_definition::<C>(
                 def,
                 &required_types,
                 &union_types,
@@ -3219,15 +3275,17 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         .0
         .iter()
         .filter_map(get_variant!(vk_parse::RegistryChild::Types))
-        .map(|ty| generate_aliases_of_types(ty, &required_types, &has_lifetimes, &mut ty_cache))
+        .map(|ty| {
+            generate_aliases_of_types::<C>(ty, &required_types, &has_lifetimes, &mut ty_cache)
+        })
         .collect();
 
     let feature_code: Vec<_> = features
         .iter()
-        .map(|feature| generate_feature(feature, &commands, &mut fn_cache, &has_lifetimes))
+        .map(|feature| generate_feature::<C>(feature, &commands, &mut fn_cache, &has_lifetimes))
         .collect();
     let feature_extensions_code =
-        generate_feature_extension(&spec2, &mut const_cache, &mut const_values);
+        generate_feature_extension::<C>(&spec2, &mut const_cache, &mut const_values);
 
     let ConstDebugs {
         core: core_debugs,
@@ -3236,7 +3294,7 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
 
     let src_dir = src_dir.as_ref();
 
-    let vk_dir = src_dir.join("vk");
+    let vk_dir = src_dir.join(C::MODULE_NAME);
     std::fs::create_dir_all(&vk_dir).expect("failed to create vk dir");
 
     let vk_features_file = File::create(vk_dir.join("features.rs")).expect("vk/features.rs");
@@ -3252,11 +3310,13 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         File::create(vk_dir.join("const_debugs.rs")).expect("vk/const_debugs.rs");
     let vk_aliases_file = File::create(vk_dir.join("aliases.rs")).expect("vk/aliases.rs");
 
+    let mod_ident = Ident::new(C::MODULE_NAME, Span::call_site());
+    let mod_ident = &mod_ident;
     let feature_code = quote! {
         use core::ffi::*;
-        use crate::vk::bitflags::*;
-        use crate::vk::definitions::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::definitions::*;
+        use crate::#mod_ident::enums::*;
         #(#feature_code)*
     };
 
@@ -3264,14 +3324,14 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         use core::marker::PhantomData;
         use core::fmt;
         use core::ffi::*;
-        use crate::vk::{Handle, ptr_chain_iter};
-        use crate::vk::aliases::*;
-        use crate::vk::bitflags::*;
-        use crate::vk::constants::*;
-        use crate::vk::enums::*;
-        use crate::vk::native::*;
-        use crate::vk::platform_types::*;
-        use crate::vk::prelude::*;
+        use crate::#mod_ident::{Handle, ptr_chain_iter};
+        use crate::#mod_ident::aliases::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::constants::*;
+        use crate::#mod_ident::enums::*;
+        use crate::#mod_ident::native::*;
+        use crate::#mod_ident::platform_types::*;
+        use crate::#mod_ident::prelude::*;
         #(#definition_code)*
     };
 
@@ -3282,12 +3342,12 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
     };
 
     let bitflags_code = quote! {
-        use crate::vk::definitions::*;
+        use crate::#mod_ident::definitions::*;
         #(#bitflags_code)*
     };
 
     let constants_code = quote! {
-        use crate::vk::definitions::*;
+        use crate::#mod_ident::definitions::*;
         #(#constants_code)*
     };
 
@@ -3296,34 +3356,34 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         #![allow(unused_imports)]        // for sometimes-dead `use` in extension modules
 
         use core::ffi::*;
-        use crate::vk::platform_types::*;
-        use crate::vk::aliases::*;
-        use crate::vk::bitflags::*;
-        use crate::vk::definitions::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::platform_types::*;
+        use crate::#mod_ident::aliases::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::definitions::*;
+        use crate::#mod_ident::enums::*;
         #(#extension_constants)*
         #(#extension_cmds)*
     };
 
     let feature_extensions_code = quote! {
-        use crate::vk::bitflags::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::enums::*;
        #feature_extensions_code
     };
 
     let const_debugs = quote! {
         use core::fmt;
-        use crate::vk::bitflags::*;
-        use crate::vk::definitions::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::definitions::*;
+        use crate::#mod_ident::enums::*;
         use crate::prelude::debug_flags;
         #const_debugs
     };
 
     let aliases = quote! {
-        use crate::vk::bitflags::*;
-        use crate::vk::definitions::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::definitions::*;
+        use crate::#mod_ident::enums::*;
         #(#aliases)*
     };
 
@@ -3360,22 +3420,16 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
 
     let vk_include = vk_headers_dir.join("include");
 
-    let mut bindings = bindgen::Builder::default().use_core().clang_arg(format!(
-        "-I{}",
-        vk_include.to_str().expect("Valid UTF8 string")
-    ));
+    let mut bindings = bindgen::Builder::default().use_core()
+        .clang_arg(format!(
+            "-I{}",
+            vk_include.to_str().expect("Valid UTF8 string")
+        ));
 
     let (header_includes, header_types) = extract_native_types(&spec2);
 
     for (_name, path) in header_includes {
-        let path = if path == "vk_platform.h" {
-            // Fix broken path, https://github.com/KhronosGroup/Vulkan-Docs/pull/1538
-            // Reintroduced in: https://github.com/KhronosGroup/Vulkan-Docs/issues/1573
-            vk_include.join("vulkan").join(path)
-        } else {
-            vk_include.join(path)
-        };
-        bindings = bindings.header(path.to_str().expect("Valid UTF8 string"));
+        bindings = C::update_bindgen_header(path.as_str(), vk_include.as_ref(), bindings);
     }
 
     for typ in header_types {
@@ -3405,4 +3459,53 @@ pub fn write_source_code<P: AsRef<Path>>(vk_headers_dir: &Path, src_dir: P) {
         .expect("Unable to generate native bindings")
         .write_to_file(vk_dir.join("native.rs"))
         .expect("Couldn't write native bindings!");
+}
+
+/// TODO: source vendor tags from spec xml
+///
+/// See: [`config::ApiConfig::VENDOR_SUFFIXES`]
+pub fn variant_ident<C>(enum_name: &str, variant_name: &str) -> Ident
+where
+    C: ApiConfig + ?Sized,
+{
+    static_regex! {
+        TRAILING_NUMBER = r"(\d+)$",
+        LEADING_NUMBER = r"^\d",
+    }
+    let (vendor, struct_name) = C::variant_prefix(enum_name)
+        .map_or_else(|| {
+            let struct_name = enum_name.strip_bits_suffix();
+            let struct_name = struct_name.to_shouty_snake_case();
+            let (vendor, struct_name) = C::strip_vendor_suffix(struct_name.as_str());
+            let struct_name = TRAILING_NUMBER.replace(struct_name, "_$1");
+            (vendor, struct_name.into_owned())
+        }, |s| ("", s.to_string()));
+
+    let variant_name = variant_name.to_uppercase();
+    let variant_name = variant_name.strip_suffix(vendor)
+        .and_then(|s| s.strip_suffix('_'))
+        .unwrap_or(&variant_name);
+    let variant_name = variant_name
+        .strip_prefix(&*struct_name)
+        .unwrap_or_else(|| {
+            if C::RESULT_ENUM.ty == enum_name {
+                variant_name.strip_prefix(C::result_variant_prefix())
+                    .expect("failed to strip result prefix from enum variant")
+            } else {
+                panic!("Failed to strip {struct_name} prefix from enum variant {variant_name}")
+            }
+        });
+
+    // Both of the above strip_prefix leave a leading `_`:
+    let variant_name = variant_name.strip_prefix('_').unwrap_or_else(|| {
+        panic!("Failed to strip {struct_name}'s variant {variant_name}'s underscore prefix");
+    });
+    // Replace _BIT anywhere in the string, also works when there's a trailing
+    // vendor extension in the variant name that's not in the enum/type name:
+    let variant_name = variant_name.replace("_BIT", "");
+    if LEADING_NUMBER.is_match_at(variant_name.as_ref(), 0) {
+        format_ident!("TYPE_{}", variant_name)
+    } else {
+        Ident::new(&variant_name, Span::call_site())
+    }
 }
