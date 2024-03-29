@@ -1610,7 +1610,6 @@ where
     // TODO: Also needs to be more robust, vendor names can be substrings from itself, id:4
     // like NVX and NV
     let struct_name = name.to_shouty_snake_case();
-    eprintln!("struct_name: {}", &struct_name);
     let (vendor, struct_name) = config.vendor_suffixes()
         .iter().copied()
         .find_map(|vendor| struct_name.strip_suffix(vendor).map(move |n| (vendor, n)))
@@ -3034,14 +3033,23 @@ pub fn write_source_code<
 ) {
     let mut vk_xml = vk_headers_dir.to_path_buf();
     vk_xml.extend(["registry".as_ref(), config.registry_filename()]);
+    info!("writing {} bindings from {}", config.desired_api(), vk_xml.display());
     use std::fs::File;
     use std::io::Write;
-    let (spec2, _errors) = vk_parse::parse_file(&vk_xml).expect("Invalid xml file");
+    let (spec2, warnings) = vk_parse::parse_file(&vk_xml).expect("Invalid xml file");
+    warnings.into_iter().for_each(|w| {
+        warn!("warning parsing registry: {:?}", &w);
+    });
+    #[derive(Debug, Clone, Copy, thiserror::Error)]
+    #[error("no extnsions child found in registry: {0:#?}")]
+    #[repr(transparent)]
+    struct NoExtensionsError<'a>(&'a vk_parse::Registry);
     let extensions: Vec<&vk_parse::Extension> = spec2
         .0
         .iter()
         .find_map(get_variant!(vk_parse::RegistryChild::Extensions))
-        .expect("extension")
+        // .ok_or(NoExtensionsError(&spec2))
+        .expect("failed to find extensions")
         .children
         .iter()
         .filter(|e| {
