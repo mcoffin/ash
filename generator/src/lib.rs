@@ -1241,9 +1241,16 @@ where
                 notation: enum_.comment.as_deref(),
             };
             let ident = C::name_to_tokens(&extends);
+            let fuck_tmp = const_values.keys()
+                .map(Clone::clone)
+                .collect::<Vec<_>>();
+            let extends_ = &extends;
             const_values
                 .get_mut(&ident)
-                .unwrap()
+                .unwrap_or_else(move || {
+                    error!("{:?}", fuck_tmp);
+                    panic!("failed to find const values for identifier {} from extends: {}", &ident, extends_);
+                })
                 .values
                 .push(ConstantMatchInfo {
                     ident: variant_ident::<C>(&extends, ext_constant.original_name()),
@@ -1545,6 +1552,7 @@ where
     C: ApiConfig + ?Sized,
 {
     let name = enum_.name.as_ref().unwrap();
+    debug!("generating enum type: {}", name);
     let clean_name = C::strip_type_prefix(name).unwrap_or(name);
     let clean_name = clean_name.bits_to_flags();
     let ident = format_ident!("{}", clean_name);
@@ -3432,7 +3440,9 @@ where
         }, |s| ("", s.to_string()));
 
     let variant_name = variant_name.to_uppercase();
-    let variant_name = variant_name.strip_suffix(vendor).unwrap_or(&variant_name);
+    let variant_name = variant_name.strip_suffix(vendor)
+        .and_then(|s| s.strip_suffix('_'))
+        .unwrap_or(&variant_name);
     let variant_name = variant_name
         .strip_prefix(&*struct_name)
         .unwrap_or_else(|| {

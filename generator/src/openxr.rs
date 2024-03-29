@@ -91,6 +91,7 @@ impl ApiConfig for OpenXR {
         "META",
         "ML",
         "MND",
+        "MNDX",
         "MSFT",
         "NV",
         "OCULUS",
@@ -120,6 +121,7 @@ impl ApiConfig for OpenXR {
     fn variant_prefix<'a>(type_name: &'a str) -> Option<Cow<'a, str>> {
         match type_name {
             "XrStructureType" => Some(Cow::from("XR_TYPE")),
+            "XrPerfSettingsNotificationLevelEXT" => Some(Cow::from("XR_PERF_SETTINGS_NOTIF_LEVEL")),
             _ => None,
         }
     }

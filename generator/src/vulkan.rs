@@ -31,6 +31,12 @@ impl Vulkan {
             ("Queue", "Device"),
         ],
     };
+    const ACCESSOR_BLACKLIST: [&'static str; 4] = [
+        "VkBaseInStructure",
+        "VkBaseOutStructure",
+        "VkTransformMatrixKHR",
+        "VkAccelerationStructureInstanceKHR",
+    ];
 }
 
 impl ApiConfig for Vulkan {
@@ -167,5 +173,10 @@ impl ApiConfig for Vulkan {
             },
             _ => None,
         }
+    }
+
+    #[inline(always)]
+    fn generate_accessors(struct_name: &str) -> bool {
+        !Vulkan::ACCESSOR_BLACKLIST.contains(&struct_name)
     }
 }
