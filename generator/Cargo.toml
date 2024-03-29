@@ -31,4 +31,4 @@ features = ["full", "extra-traits"]
 
 [features]
 default = ["openxr"]
-openxr = []
+openxr = ["vk-parse/openxr"]

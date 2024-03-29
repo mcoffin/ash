@@ -1,6 +1,6 @@
 use generator::{
+    Vulkan,
     write_source_code,
-    VK_CONFIG,
 };
 use std::{
     borrow::Cow,
@@ -79,11 +79,11 @@ fn main() {
         .expect("failed to find output directory");
     let vk_registry_path = args.vk_registry()
         .expect("failed to find registry path");
-    write_source_code(&VK_CONFIG, vk_registry_path.as_ref(), output_dir.join("ash/src"));
+    write_source_code::<_, Vulkan>(vk_registry_path.as_ref(), output_dir.join("ash/src"));
     #[cfg(feature = "openxr")]
     {
-        use generator::openxr::XR_CONFIG;
-        write_source_code(&XR_CONFIG, args.xr_registry(), output_dir.join("ash-xr/src"));
+        use generator::openxr::OpenXR;
+        write_source_code::<_, OpenXR>(args.xr_registry(), output_dir.join("ash-xr/src"));
     }
 }
 

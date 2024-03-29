@@ -11,4 +11,5 @@ members = [
 ]
 
 [patch.crates-io.vk-parse]
-path = "../vk-parse/vk-parse"
+git = "https://github.com/mcoffin/vk-parse"
+rev = "36d718e804fc94b8f3347a2858711b2a77e6b2c4"
