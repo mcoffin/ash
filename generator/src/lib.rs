@@ -75,6 +75,14 @@ macro_rules! get_variant {
     };
 }
 
+macro_rules! static_regex {
+    ($($name:ident = $s:expr),+ $(,)?) => {
+        $(
+            static $name: Lazy<Regex> = Lazy::new(|| Regex::new($s).unwrap());
+        )+
+    };
+}
+
 pub trait ExtensionExt {}
 #[derive(Copy, Clone, Debug)]
 pub enum CType {
@@ -356,9 +364,6 @@ impl ConstantExt for vkxml::ExtensionEnum {
     fn original_name(&self) -> &str {
         &self.name
     }
-    // fn variant_ident<C: ApiConfig + ?Sized>(&self, enum_name: &str, config: &C) -> Ident {
-    //     variant_ident(enum_name, &self.name, config)
-    // }
     fn notation(&self) -> Option<&str> {
         self.notation.as_deref()
     }
@@ -376,9 +381,6 @@ impl ConstantExt for vk_parse::Enum {
     fn original_name(&self) -> &str {
         &self.name
     }
-    // fn variant_ident<C: ApiConfig + ?Sized>(&self, enum_name: &str, config: &C) -> Ident {
-    //     variant_ident(enum_name, &self.name, config)
-    // }
     fn notation(&self) -> Option<&str> {
         self.comment.as_deref()
     }
@@ -397,9 +399,6 @@ impl ConstantExt for vkxml::Constant {
     fn original_name(&self) -> &str {
         &self.name
     }
-    // fn variant_ident<C: ApiConfig + ?Sized>(&self, enum_name: &str, config: &C) -> Ident {
-    //     variant_ident(enum_name, &self.name, config)
-    // }
     fn notation(&self) -> Option<&str> {
         self.notation.as_deref()
     }
@@ -1504,9 +1503,6 @@ pub enum EnumCode {
     Bitflags(TokenStream),
     Enum(TokenStream),
 }
-
-static TRAILING_NUMBER: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d+)$").unwrap());
-static LEADING_NUMBER: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d").unwrap());
 
 pub fn bitflags_impl_block<C: ApiConfig + ?Sized>(
     ident: Ident,
@@ -2904,45 +2900,49 @@ impl<'a> Tags<'a> {
             .unwrap_or(("", name))
     }
 
-    pub fn variant_ident<C>(&self, enum_name: &str, variant_name: &str) -> Ident
-    where
-        C: ApiConfig + ?Sized,
-    {
-        let (vendor, struct_name) = C::variant_prefix(enum_name)
-            .map_or_else(|| {
-                let struct_name = enum_name.strip_bits_suffix();
-                let struct_name = struct_name.to_shouty_snake_case();
-                let (vendor, struct_name) = self.strip_suffix(struct_name.as_str());
-                let struct_name = TRAILING_NUMBER.replace(struct_name, "_$1");
-                (vendor, struct_name.into_owned())
-            }, |s| ("", s.to_string()));
+    // pub fn variant_ident<C>(&self, enum_name: &str, variant_name: &str) -> Ident
+    // where
+    //     C: ApiConfig + ?Sized,
+    // {
+    //     static_regex! {
+    //         TRAILING_NUMBER = r"(\d+)$",
+    //         LEADING_NUMBER = r"^\d",
+    //     }
+    //     let (vendor, struct_name) = C::variant_prefix(enum_name)
+    //         .map_or_else(|| {
+    //             let struct_name = enum_name.strip_bits_suffix();
+    //             let struct_name = struct_name.to_shouty_snake_case();
+    //             let (vendor, struct_name) = self.strip_suffix(struct_name.as_str());
+    //             let struct_name = TRAILING_NUMBER.replace(struct_name, "_$1");
+    //             (vendor, struct_name.into_owned())
+    //         }, |s| ("", s.to_string()));
 
-        let variant_name = variant_name.to_uppercase();
-        let variant_name = variant_name.strip_suffix(vendor).unwrap_or(&variant_name);
-        let variant_name = variant_name
-            .strip_prefix(&*struct_name)
-            .unwrap_or_else(|| {
-                if C::RESULT_ENUM.ty == enum_name {
-                    variant_name.strip_prefix(C::result_variant_prefix())
-                        .expect("failed to strip result prefix from enum variant")
-                } else {
-                    panic!("Failed to strip {struct_name} prefix from enum variant {variant_name}")
-                }
-            });
+    //     let variant_name = variant_name.to_uppercase();
+    //     let variant_name = variant_name.strip_suffix(vendor).unwrap_or(&variant_name);
+    //     let variant_name = variant_name
+    //         .strip_prefix(&*struct_name)
+    //         .unwrap_or_else(|| {
+    //             if C::RESULT_ENUM.ty == enum_name {
+    //                 variant_name.strip_prefix(C::result_variant_prefix())
+    //                     .expect("failed to strip result prefix from enum variant")
+    //             } else {
+    //                 panic!("Failed to strip {struct_name} prefix from enum variant {variant_name}")
+    //             }
+    //         });
 
-        // Both of the above strip_prefix leave a leading `_`:
-        let variant_name = variant_name.strip_prefix('_').unwrap_or_else(|| {
-            panic!("Failed to strip {struct_name}'s variant {variant_name}'s underscore prefix");
-        });
-        // Replace _BIT anywhere in the string, also works when there's a trailing
-        // vendor extension in the variant name that's not in the enum/type name:
-        let variant_name = variant_name.replace("_BIT", "");
-        if LEADING_NUMBER.is_match_at(variant_name.as_ref(), 0) {
-            format_ident!("TYPE_{}", variant_name)
-        } else {
-            Ident::new(&variant_name, Span::call_site())
-        }
-    }
+    //     // Both of the above strip_prefix leave a leading `_`:
+    //     let variant_name = variant_name.strip_prefix('_').unwrap_or_else(|| {
+    //         panic!("Failed to strip {struct_name}'s variant {variant_name}'s underscore prefix");
+    //     });
+    //     // Replace _BIT anywhere in the string, also works when there's a trailing
+    //     // vendor extension in the variant name that's not in the enum/type name:
+    //     let variant_name = variant_name.replace("_BIT", "");
+    //     if LEADING_NUMBER.is_match_at(variant_name.as_ref(), 0) {
+    //         format_ident!("TYPE_{}", variant_name)
+    //     } else {
+    //         Ident::new(&variant_name, Span::call_site())
+    //     }
+    // }
 }
 
 pub fn write_source_code<
@@ -3411,112 +3411,49 @@ pub fn write_source_code<
         .expect("Couldn't write native bindings!");
 }
 
-/// TODO FUCK
+/// TODO: source vendor tags from spec xml
+///
+/// See: [`config::ApiConfig::VENDOR_SUFFIXES`]
 pub fn variant_ident<C>(enum_name: &str, variant_name: &str) -> Ident
 where
     C: ApiConfig + ?Sized,
 {
-    unimplemented!()
-}
+    static_regex! {
+        TRAILING_NUMBER = r"(\d+)$",
+        LEADING_NUMBER = r"^\d",
+    }
+    let (vendor, struct_name) = C::variant_prefix(enum_name)
+        .map_or_else(|| {
+            let struct_name = enum_name.strip_bits_suffix();
+            let struct_name = struct_name.to_shouty_snake_case();
+            let (vendor, struct_name) = C::strip_vendor_suffix(struct_name.as_str());
+            let struct_name = TRAILING_NUMBER.replace(struct_name, "_$1");
+            (vendor, struct_name.into_owned())
+        }, |s| ("", s.to_string()));
 
-// pub const VK_CONFIG: VkConfig<'static> = VkConfig {
-//     desired_api: "vulkan",
-//     module_name: "vk",
-//     type_prefix: "Vk",
-//     command_prefix: "vk",
-//     constant_prefix: "VK_",
-//     registry_filename: "vk.xml",
-//     flag_suffixes: ("FlagBits", "Flags"),
-//     tagged_struct: config::StructConfig {
-//         ty: "VkStructureType",
-//         ty_name: "s_type",
-//         next_name: "p_next",
-//     },
-//     result: config::ResultConfig {
-//         ty: "VkResult",
-//         prefix: None,
-//     },
-//     functions: config::FunctionsConfig {
-//         static_fns: &[
-//             "vkGetInstanceProcAddr",
-//         ],
-//         entry_fns: &[
-//             "vkCreateInstance",
-//             "vkEnumerateInstanceLayerProperties",
-//             "vkEnumerateInstanceExtensionProperties",
-//             "vkEnumerateInstanceVersion",
-//         ],
-//         dispatch_fns: &[
-//             ("vkGetDeviceProcAddr", "Instance"),
-//         ],
-//         dispatch_types: &[
-//             "Instance",
-//             "Device",
-//         ],
-//         dispatch_hints: &[
-//             ("CommandBuffer", "Device"),
-//             ("Queue", "Device"),
-//         ],
-//     },
-//     allowed_count_members: &[
-//         // pViewports is allowed to be empty if the viewport state is empty
-//         ("VkPipelineViewportStateCreateInfo", "viewportCount"),
-//         // Must match viewportCount
-//         ("VkPipelineViewportStateCreateInfo", "scissorCount"),
-//         // descriptorCount is settable regardless of having pImmutableSamplers
-//         ("VkDescriptorSetLayoutBinding", "descriptorCount"),
-//         // No ImageView attachments when VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT is set
-//         ("VkFramebufferCreateInfo", "attachmentCount"),
-//         // descriptorCount also describes descriptor length in pNext extension structures
-//         // https://github.com/ash-rs/ash/issues/806
-//         ("VkWriteDescriptorSet", "descriptorCount"),
-//     ],
-//     accessor_blacklist: &[
-//         "VkBaseInStructure",
-//         "VkBaseOutStructure",
-//         "VkTransformMatrixKHR",
-//         "VkAccelerationStructureInstanceKHR",
-//     ],
-//     vendor_suffixes: &[
-//         "_AMD",
-//         "_AMDX",
-//         "_ANDROID",
-//         "_ARM",
-//         "_BRCM",
-//         "_CHROMIUM",
-//         "_EXT",
-//         "_FB",
-//         "_FSL",
-//         "_FUCHSIA",
-//         "_GGP",
-//         "_GOOGLE",
-//         "_HUAWEI",
-//         "_IMG",
-//         "_INTEL",
-//         "_JUICE",
-//         "_KDAB",
-//         "_KHR",
-//         "_KHX",
-//         "_LUNARG",
-//         "_MESA",
-//         "_MSFT",
-//         "_MVK",
-//         "_NN",
-//         "_NV",
-//         "_NVX",
-//         "_NXP",
-//         "_NZXT",
-//         "_QCOM",
-//         "_QNX",
-//         "_RASTERGRID",
-//         "_RENDERDOC",
-//         "_SAMSUNG",
-//         "_SEC",
-//         "_TIZEN",
-//         "_VALVE",
-//         "_VIV",
-//         "_VSI",
-//     ],
-//     pfn_prefix: Some("PFN_"),
-//     variant_prefixes: &[],
-// };
+    let variant_name = variant_name.to_uppercase();
+    let variant_name = variant_name.strip_suffix(vendor).unwrap_or(&variant_name);
+    let variant_name = variant_name
+        .strip_prefix(&*struct_name)
+        .unwrap_or_else(|| {
+            if C::RESULT_ENUM.ty == enum_name {
+                variant_name.strip_prefix(C::result_variant_prefix())
+                    .expect("failed to strip result prefix from enum variant")
+            } else {
+                panic!("Failed to strip {struct_name} prefix from enum variant {variant_name}")
+            }
+        });
+
+    // Both of the above strip_prefix leave a leading `_`:
+    let variant_name = variant_name.strip_prefix('_').unwrap_or_else(|| {
+        panic!("Failed to strip {struct_name}'s variant {variant_name}'s underscore prefix");
+    });
+    // Replace _BIT anywhere in the string, also works when there's a trailing
+    // vendor extension in the variant name that's not in the enum/type name:
+    let variant_name = variant_name.replace("_BIT", "");
+    if LEADING_NUMBER.is_match_at(variant_name.as_ref(), 0) {
+        format_ident!("TYPE_{}", variant_name)
+    } else {
+        Ident::new(&variant_name, Span::call_site())
+    }
+}

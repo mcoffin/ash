@@ -44,6 +44,12 @@ pub trait ApiConfig {
     const CONSTANT_PREFIX: &'static str;
     const TAGGED_STRUCT: StructConfig<'static>;
     const RESULT_ENUM: ResultConfig<'static>;
+    /// **TODO**: this should be read from the spec xml (see `tags`), but code organization of
+    /// [`crate::variant_ident`] means we'd have to pass that contextual info though 100 places to
+    /// get it in there
+    ///
+    /// <https://github.com/ash-rs/ash/blob/aee0c61cf1d466c6cf934f2375063fb88b806476/generator/src/lib.rs#L3374>
+    const VENDOR_SUFFIXES: &'static [&'static str];
     fn function_type<'a>(f: &'a vk_parse::CommandDefinition) -> FunctionType<'a>;
     /// based on original function name, gets the name of a the function pointer type
     ///
@@ -125,6 +131,13 @@ pub trait ApiExt: ApiConfig {
     #[inline(always)]
     fn strip_type_prefix(s: &str) -> Option<&str> {
         s.strip_prefix(Self::TYPE_PREFIX)
+    }
+
+    fn strip_vendor_suffix<'a>(name: &'a str) -> (&'static str, &'a str) {
+        Self::VENDOR_SUFFIXES.iter().copied()
+            .filter_map(|vendor| name.strip_vendor_suffix(vendor).map(move |n| (vendor, n)))
+            .max_by_key(|(vendor, ..)| vendor.len())
+            .unwrap_or(("", name))
     }
 
     #[inline(always)]
