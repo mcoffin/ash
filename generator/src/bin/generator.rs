@@ -4,58 +4,94 @@ use generator::{
 };
 use std::{
     borrow::Cow,
-    ffi::OsStr,
+    error::Error,
     path::{
         Path,
         PathBuf,
     },
+    sync::Arc,
 };
+use lazy_static::lazy_static;
 
-#[inline(always)]
-fn env_or<'a, K: AsRef<OsStr>>(key: K, default_value: &'a Path) -> Cow<'a, Path> {
-    std::env::var_os(key)
-        .map(PathBuf::from)
-        .map_or(Cow::Borrowed(default_value), Cow::Owned)
+#[path = "../logging.rs"]
+mod logging;
+
+#[derive(Debug, clap::Parser)]
+#[clap(version = env!("CARGO_PKG_VERSION"))]
+struct Args {
+    #[clap(long = "output-directory", short = 'o')]
+    out_dir: Option<PathBuf>,
+    #[clap(long, env = "ASH_VK_REGISTRY")]
+    vk_registry: Option<PathBuf>,
+    #[cfg(feature = "openxr")]
+    #[clap(long, env = "ASH_XR_REGISTRY")]
+    xr_registry: Option<PathBuf>,
 }
 
-mod logging {
-    use std::sync::Once;
+type SharedError = Arc<dyn Error + Send + Sync + 'static>;
 
-    static INIT_LOGGING: Once = Once::new();
+lazy_static! {
+    static ref PROJECT_DIR: Result<PathBuf, SharedError> = {
+        let mut d = std::env::current_dir()
+            .map_err(|e| Arc::new(e) as Arc<dyn Error + Send + Sync + 'static>)?;
+        while !d.join("ash/src").exists() {
+            if !d.pop() {
+                return Err(Arc::new(ProjectDirectoryNotFound) as _);
+            }
+        }
+        Ok(d)
+    };
+}
 
-    pub fn init() {
-        use env_logger::{
-            Env, Builder,
-        };
-        INIT_LOGGING.call_once(|| {
-            const DEFAULT_LOG_FILTER: &'static str = concat!(env!("CARGO_CRATE_NAME"), "=debug");
-            let cfg = Env::default()
-                .default_filter_or(DEFAULT_LOG_FILTER);
-            Builder::from_env(cfg).init();
-        });
+#[inline(always)]
+fn project_dir() -> Result<&'static Path, SharedError> {
+    PROJECT_DIR.as_ref()
+        .map_err(Clone::clone)
+        .map(AsRef::as_ref)
+}
+
+impl Args {
+    fn output_dir<'a>(&'a self) -> Result<&'a Path, SharedError> {
+        if let Some(p) = self.out_dir.as_deref() {
+            return Ok(p);
+        }
+        project_dir()
+    }
+    fn vk_registry(&self) -> Result<Cow<'_, Path>, SharedError> {
+        if let Some(p) = self.vk_registry.as_deref() {
+            return Ok(Cow::Borrowed(p));
+        }
+        project_dir()
+            .map(|d| Cow::Owned(d.join("generator/Vulkan-Headers")))
+    }
+    #[cfg(feature = "openxr")]
+    fn xr_registry(&self) -> &Path {
+        self.xr_registry.as_deref()
+            .unwrap_or("/usr/share/openxr".as_ref())
     }
 }
 
 fn main() {
+    use clap::Parser;
     logging::init();
-    let cwd = std::env::current_dir().unwrap();
-    let (vk_path_default, out_path) = if cwd.ends_with("generator") {
-        (Path::new("Vulkan-Headers"), "../ash/src")
-    } else {
-        (Path::new("generator/Vulkan-Headers"), "ash/src")
-    };
-    let vk_path = env_or("ASH_VK_REGISTRY", vk_path_default);
-    write_source_code(&VK_CONFIG, vk_path.as_ref(), out_path);
-
+    let args = Args::parse();
+    let output_dir = args.output_dir()
+        .expect("failed to find output directory");
+    let vk_registry_path = args.vk_registry()
+        .expect("failed to find registry path");
+    write_source_code(&VK_CONFIG, vk_registry_path.as_ref(), output_dir.join("ash/src"));
     #[cfg(feature = "openxr")]
     {
-        use generator::openxr as xr;
-        let xr_dir = if cwd.ends_with("generator") {
-            "../ash-xr/src"
-        } else {
-            "ash-xr/src"
-        };
-        let xr_registry_path = env_or("ASH_XR_REGISTRY", "/usr/share/openxr".as_ref());
-        write_source_code(&xr::XR_CONFIG, xr_registry_path.as_ref(), xr_dir);
+        use generator::openxr::XR_CONFIG;
+        write_source_code(&XR_CONFIG, args.xr_registry(), output_dir.join("ash-xr/src"));
     }
 }
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("unable to find project output directory automatically")]
+struct ProjectDirectoryNotFound;
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("{0} registry not found")]
+#[repr(transparent)]
+struct RegistryNotFound<'a>(&'a str);

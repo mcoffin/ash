@@ -3065,7 +3065,8 @@ pub fn write_source_code<
         })
         .collect();
 
-    let spec = vk_parse::parse_file_as_vkxml(&vk_xml).expect("Invalid xml file.");
+    let spec = vk_parse::parse_file_as_vkxml(&vk_xml)
+        .expect("Invalid xml file.");
 
     let features: Vec<&vkxml::Feature> = spec
         .elements

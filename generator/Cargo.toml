@@ -22,11 +22,13 @@ vkxml = "0.3"
 thiserror = "1.0"
 log = "0.4"
 env_logger = "0.11"
+clap = { version = "4.5", features = ["derive", "cargo", "env"] }
+lazy_static = "1.4"
 
 [dependencies.syn]
 version = "2.0"
 features = ["full", "extra-traits"]
 
 [features]
-default = []
+default = ["openxr"]
 openxr = []

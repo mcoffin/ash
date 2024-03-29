@@ -9,3 +9,6 @@ members = [
     "generator",
     "generator-rewrite",
 ]
+
+[patch.crates-io.vk-parse]
+path = "../vk-parse/vk-parse"
