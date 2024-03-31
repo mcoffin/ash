@@ -3282,6 +3282,10 @@ pub fn write_source_code<
 
     let feature_code: Vec<_> = features
         .iter()
+        .filter(|&vkxml::Feature { name, .. }| {
+            name.strip_prefix(C::CONSTANT_PREFIX)
+                .map_or(false, |s| !s.starts_with("LOADER_VERSION"))
+        })
         .map(|feature| generate_feature::<C>(feature, &commands, &mut fn_cache, &has_lifetimes))
         .collect();
     let feature_extensions_code =
