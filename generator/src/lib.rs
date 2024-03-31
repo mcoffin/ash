@@ -20,6 +20,7 @@ use nom::{
         char, digit1, hex_digit1, multispace0, multispace1, newline, none_of, one_of,
     },
     combinator::{map, map_res, opt, value},
+    error::{FromExternalError, ParseError},
     multi::{many1, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, terminated, tuple},
     IResult, Parser,
@@ -48,11 +49,8 @@ pub use openxr::OpenXR;
 
 pub mod config;
 pub(crate) mod util;
-use util::{
-    NameExt,
-    EnumsExt,
-    EnumType,
-};
+
+use util::*;
 use config::{
     ApiConfig,
     ApiExt,
@@ -216,7 +214,7 @@ fn parse_c_define_header(i: &str) -> IResult<&str, (Option<&str>, (&str, Option<
     ))(i)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum CReferenceType {
     Value,
     PointerToConst,
@@ -225,6 +223,18 @@ enum CReferenceType {
     PointerToPointerToConst,
     PointerToConstPointer,
     PointerToConstPointerToConst,
+}
+
+impl CReferenceType {
+    fn inc(&mut self) {
+        use CReferenceType::*;
+        *self = match self {
+            Value => Pointer,
+            PointerToConst
+            | Pointer => PointerToPointer,
+            _ => panic!("CReferenceType cannot handle this type (too many levels of pointer misdirection"),
+        };
+    }
 }
 
 #[derive(Debug)]
@@ -239,12 +249,13 @@ fn parse_c_type(i: &str) -> IResult<&str, CParameterType<'_>> {
             tuple((
                 opt(tag("const ")),
                 preceded(opt(tag("struct ")), parse_c_identifier),
-                opt(char('*')),
+                multispace0,
+                opt(char('*'))
             )),
             multispace0,
             opt(pair(opt(tag("const")), char('*'))),
         ),
-        |((const_, name, firstptr), secondptr)| CParameterType {
+        |((const_, name, _, firstptr), secondptr)| CParameterType {
             name,
             reference_type: match (firstptr, secondptr) {
                 (None, None) => CReferenceType::Value,
@@ -276,6 +287,43 @@ struct CParameter<'a> {
     static_array: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CArraySuffix {
+    Dynamic,
+    Static(usize),
+}
+
+impl CArraySuffix {
+    fn parser<'a, E>() -> impl Parser<&'a str, Self, E>
+    where
+        E: ParseError<&'a str>,
+        E: FromExternalError<&'a str, std::num::ParseIntError>,
+    {
+        // fn parse_static_array(i: &str) -> IResult<&str, CArraySuffix> {
+        //     (map(
+        //         delimited(
+        //             char('['), map_res(digit1, str::parse), char(']')
+        //         ),
+        //         CArraySuffix::Static
+        //     ))(i)
+        // }
+        // fn parse_dynamic_array(i: &str) -> IResult<&str, CArraySuffix> {
+        //     (map(
+        //         pair(
+        //             char('['), char(']')
+        //         ),
+        //         |_| CArraySuffix::Dynamic
+        //     ))(i)
+        // }
+        // (alt((
+        //     parse_static_array,
+        //     parse_dynamic_array
+        // )))(i)
+        map(delimited(char('['), map_res(digit1, str::parse), char(']')), Self::Static)
+            .or(map(pair(char('['), char(']')), |_| Self::Dynamic))
+    }
+}
+
 /// Parses a single C parameter instance, for example:
 ///
 /// ```c
@@ -288,13 +336,22 @@ fn parse_c_parameter(i: &str) -> IResult<&str, CParameter<'_>> {
             multispace0,
             pair(
                 parse_c_identifier,
-                opt(delimited(char('['), map_res(digit1, str::parse), char(']'))),
+                opt(CArraySuffix::parser()),
             ),
         ),
-        |(type_, (name, static_array))| CParameter {
-            type_,
-            _name: name,
-            static_array,
+        |(mut type_, (name, arr))| {
+            let static_array = arr.and_then(|v| match v {
+                CArraySuffix::Static(len) => Some(len),
+                CArraySuffix::Dynamic => {
+                    type_.reference_type.inc();
+                    None
+                },
+            });
+            CParameter {
+                type_,
+                _name: name,
+                static_array,
+            }
         },
     ))(i)
 }
@@ -874,6 +931,9 @@ impl FieldExt for vk_parse::CommandParam {
     {
         assert!(!self.is_void(), "{:?}", self);
         let (rem, ty) = parse_c_parameter(&self.definition.code).unwrap();
+        if !rem.is_empty() {
+            panic!("Leftover tokens: {:?} while parsing code:\n{}", rem, &self.definition.code);
+        }
         assert!(rem.is_empty());
         let type_name = C::name_to_tokens(ty.type_.name);
         let type_name = quote!(#type_name #type_lifetime);
@@ -1392,7 +1452,7 @@ where
 pub fn generate_define<C: ApiConfig + ?Sized>(
     define: &vk_parse::Type,
     allowed_types: &HashSet<&str>,
-    identifier_renames: &mut BTreeMap<String, Ident>,
+    _identifier_renames: &mut BTreeMap<String, Ident>,
 ) -> TokenStream {
     let vk_parse::TypeSpec::Code(spec) = &define.spec else {
         return quote!();
@@ -1400,58 +1460,11 @@ pub fn generate_define<C: ApiConfig + ?Sized>(
     let [vk_parse::TypeCodeMarkup::Name(define_name), ..] = &spec.markup[..] else {
         return quote!();
     };
-
-    if !allowed_types.contains(define_name.as_str()) {
+    if !allowed_types.contains(define_name.as_str()) && !C::IGNORE_REQUIRED {
         return quote!();
     }
-
-    let name = C::strip_constant_prefix(define_name)
-        .unwrap_or(define_name);
-    let ident = format_ident!("{}", name);
-
-    if define_name.contains("VERSION") && !spec.code.contains("//#define") {
-        let link = khronos_link(define_name);
-        let (c_expr, (comment, (_name, parameters))) = parse_c_define_header(&spec.code).unwrap();
-        let c_expr = c_expr.trim().trim_start_matches('\\');
-        let c_expr = c_expr.replace("(uint32_t)", "");
-        let c_expr = convert_c_expression::<C>(&c_expr, identifier_renames);
-        let c_expr = discard_outmost_delimiter(c_expr);
-
-        let deprecated = comment
-            .and_then(|c| c.trim().strip_prefix("DEPRECATED: "))
-            .map(|comment| quote!(#[deprecated = #comment]))
-            .or_else(|| match define.deprecated.as_ref()?.as_str() {
-                "true" => Some(quote!(#[deprecated])),
-                "aliased" => {
-                    Some(quote!(#[deprecated = "an old name not following Vulkan conventions"]))
-                }
-                x => panic!("Unknown deprecation reason {}", x),
-            });
-
-        let (code, ident) = if let Some(parameters) = parameters {
-            let params = parameters
-                .iter()
-                .map(|param| format_ident!("{}", param))
-                .map(|i| quote!(#i: u32));
-            let ident = format_ident!("{}", name.to_lowercase());
-            (
-                quote!(pub const fn #ident(#(#params),*) -> u32 { #c_expr }),
-                ident,
-            )
-        } else {
-            (quote!(pub const #ident: u32 = #c_expr;), ident)
-        };
-
-        identifier_renames.insert(define_name.clone(), ident);
-
-        quote! {
-            #deprecated
-            #[doc = #link]
-            #code
-        }
-    } else {
-        quote!()
-    }
+    C::generate_define(define_name, spec)
+        .unwrap_or_else(|| quote!())
 }
 pub fn generate_typedef<C>(
     typedef: &vkxml::Typedef,
@@ -1874,17 +1887,24 @@ where
 
     let name = C::name_to_tokens(&struct_.name);
 
+    let tag_info = TaggedStructInfo::get::<C>(members);
     // TODO: try to use better info than the field names since openxr names them less uniquely
-    let next_field = members
-        .iter()
-        .find(|member| &member.vkxml_field.param_ident() == C::TAGGED_STRUCT.next_name);
+    // let next_field = members
+    //     .iter()
+    //     .find(|member| &member.vkxml_field.param_ident() == C::TAGGED_STRUCT.next_name);
 
-    let structure_type_field = members
-        .iter()
-        .find(|member| &member.vkxml_field.param_ident() == C::TAGGED_STRUCT.ty_name);
+    // let structure_type_field = members
+    //     .iter()
+    //     .find(|member| &member.vkxml_field.param_ident() == C::TAGGED_STRUCT.ty_name);
 
-    // Must either have both, or none:
-    assert_eq!(next_field.is_some(), structure_type_field.is_some());
+    // // Must either have both, or none:
+    // if next_field.is_some() != structure_type_field.is_some() {
+    //     panic!(
+    //         "invalid half-tagged struct: {}\nnext_field: {:?}\nstructure_type_field: {:?}",
+    //         &struct_.name, &next_field, &structure_type_field
+    //     );
+    // }
+    // assert_eq!(next_field.is_some(), structure_type_field.is_some());
 
     // TODO: review logic and fix theirs
     // use ApiConfig::member_separate_count
@@ -1927,6 +1947,12 @@ where
         if skip_members.contains(&name) {
             return None;
         }
+        if tag_info.as_ref().into_iter()
+            .flat_map(|v| [v.type_field, v.next_field])
+            .filter_map(|v| v.vk_parse_type_member.name())
+            .any(|n| n == name) {
+            return None;
+        }
 
         let deprecated = member.deprecated.as_ref().map(|d| quote!(#d #[allow(deprecated)]));
         let param_ident = field.param_ident();
@@ -1936,8 +1962,8 @@ where
         let param_ty_tokens = field.safe_type_tokens::<C>(quote!('a), type_lifetime.clone(), None);
 
         let param_ident_string = param_ident.to_string();
-        if &param_ident_string == C::TAGGED_STRUCT.next_name
-            || &param_ident_string == C::TAGGED_STRUCT.ty_name {
+        if param_ident_string == C::TAGGED_STRUCT.next_name
+            || param_ident_string == C::TAGGED_STRUCT.ty_name {
             return None;
         }
 
@@ -2174,7 +2200,9 @@ where
     let extends_name = format_ident!("Extends{}", name);
 
     // The `p_next` field should only be considered if this struct is also a root struct
-    let root_struct_next_field = next_field.filter(|_| root_structs.contains(&name));
+    let root_struct_next_field = tag_info.as_ref()
+        .map(|v| v.next_field)
+        .filter(|_| root_structs.contains(&name));
 
     // We only implement a next method for root structs with a `pnext` field.
     let next_function = if let Some(next_member) = root_struct_next_field {
@@ -2235,7 +2263,7 @@ where
             quote!(unsafe impl #extends for #name<'_> {})
         });
 
-    let impl_structure_type_trait = structure_type_field.map(|member| {
+    let impl_structure_type_trait = tag_info.as_ref().map(|TaggedStructInfo { type_field: member, .. }| {
         let struct_name = &struct_.name;
         let m_field = &member.vkxml_field;
         let value = member
@@ -2248,7 +2276,7 @@ where
 
         assert!(!value.contains(','));
 
-        let value = variant_ident::<C>(C::RESULT_ENUM.ty, value);
+        let value = variant_ident::<C>(C::TAGGED_STRUCT.ty, value);
         quote! {
             unsafe impl #lifetime TaggedStructure for #name #lifetime {
                 const STRUCTURE_TYPE: StructureType = StructureType::#value;
@@ -2271,7 +2299,8 @@ where
     Some(q)
 }
 
-struct PreprocessedMember<'a> {
+#[derive(Debug)]
+pub(crate) struct PreprocessedMember<'a> {
     vkxml_field: &'a vkxml::Field,
     vk_parse_type_member: &'a vk_parse::TypeMemberDefinition,
     deprecated: Option<TokenStream>,
@@ -2498,7 +2527,7 @@ where
             type_
                 .name
                 .as_ref()
-                .map_or(false, |name| allowed_types.contains(name.as_str()))
+                .map_or(false, |name| C::IGNORE_REQUIRED || allowed_types.contains(name.as_str()))
         })
         .filter_map(|type_| type_.structextends.as_ref())
         .flat_map(|e| e.split(','))
@@ -2539,14 +2568,17 @@ pub fn generate_definition<C>(
 where
     C: ApiConfig + ?Sized,
 {
+    let type_allowed = move |name: &str| {
+        C::IGNORE_REQUIRED || allowed_types.contains(name)
+    };
     match *definition {
         vkxml::DefinitionsElement::Typedef(ref typedef)
-            if allowed_types.contains(typedef.name.as_str()) =>
+            if type_allowed(typedef.name.as_str()) =>
         {
             Some(generate_typedef::<C>(typedef))
         }
         vkxml::DefinitionsElement::Struct(ref struct_)
-            if allowed_types.contains(struct_.name.as_str()) =>
+            if type_allowed(struct_.name.as_str()) =>
         {
             Some(generate_struct::<C>(
                 struct_,
@@ -2557,20 +2589,20 @@ where
             ))
         }
         vkxml::DefinitionsElement::Bitmask(ref mask)
-            if allowed_types.contains(mask.name.as_str()) =>
+            if type_allowed(mask.name.as_str()) =>
         {
             generate_bitmask::<C>(mask, bitflags_cache, const_values)
         }
         vkxml::DefinitionsElement::Handle(ref handle)
-            if allowed_types.contains(handle.name.as_str()) =>
+            if type_allowed(handle.name.as_str()) =>
         {
             generate_handle::<C>(handle)
         }
-        vkxml::DefinitionsElement::FuncPtr(ref fp) if allowed_types.contains(fp.name.as_str()) => {
+        vkxml::DefinitionsElement::FuncPtr(ref fp) if type_allowed(fp.name.as_str()) => {
             Some(generate_funcptr::<C>(fp, has_lifetimes))
         }
         vkxml::DefinitionsElement::Union(ref union)
-            if allowed_types.contains(union.name.as_str()) =>
+            if type_allowed(union.name.as_str()) =>
         {
             Some(generate_union::<C>(union, has_lifetimes))
         }
@@ -2851,7 +2883,7 @@ where
         .filter_map(get_variant!(vk_parse::TypesChild::Type))
         .filter_map(|ty| {
             let name = ty.name.as_ref()?;
-            if !allowed_types.contains(name.as_str()) {
+            if !allowed_types.contains(name.as_str()) || C::IGNORE_REQUIRED {
                 return None;
             }
             let alias = ty.alias.as_ref()?;
@@ -2997,7 +3029,7 @@ pub fn write_source_code<
     let spec = vk_parse::parse_file_as_vkxml(&vk_xml)
         .expect("Invalid xml file.");
 
-    let tags = Tags::from_registry(&spec2);
+    let _tags = Tags::from_registry(&spec2);
 
     let features: Vec<&vkxml::Feature> = spec
         .elements
@@ -3032,7 +3064,7 @@ pub fn write_source_code<
     let (required_types, required_commands) = features_children
         .chain(extension_children)
         .filter_map(get_variant!(vk_parse::FeatureChild::Require { api, items }))
-        .filter(|(api, _items)| api.as_deref() == None || api.as_deref() == Some(C::NAME))
+        .filter(|(api, _items)| api.as_deref().is_none() || api.as_deref() == Some(C::NAME))
         .flat_map(|(_api, items)| items)
         .fold((HashSet::new(), HashSet::new()), |mut acc, elem| {
             match elem {
@@ -3053,7 +3085,7 @@ pub fn write_source_code<
         .filter_map(get_variant!(vk_parse::RegistryChild::Commands))
         .flat_map(|cmds| &cmds.children)
         .filter_map(get_variant!(vk_parse::Command::Definition))
-        .filter(|cmd| required_commands.contains(&cmd.proto.name.as_str()))
+        .filter(|cmd| C::IGNORE_REQUIRED || required_commands.contains(&cmd.proto.name.as_str()))
         .map(|cmd| (cmd.proto.name.clone(), cmd))
         .collect();
 
@@ -3063,7 +3095,7 @@ pub fn write_source_code<
         .filter_map(get_variant!(vk_parse::RegistryChild::Commands))
         .flat_map(|cmds| &cmds.children)
         .filter_map(get_variant!(vk_parse::Command::Alias { name, alias }))
-        .filter(|(name, _alias)| required_commands.contains(name.as_str()))
+        .filter(|(name, _alias)| C::IGNORE_REQUIRED || required_commands.contains(name.as_str()))
         .map(|(name, alias)| (name.as_str(), alias.as_str()))
         .collect();
 
@@ -3078,7 +3110,7 @@ pub fn write_source_code<
         .iter()
         .filter_map(get_variant!(vk_parse::RegistryChild::Enums))
         .filter(|enums| enums.kind.is_some())
-        .filter(|enums| {
+        .filter(|enums| C::IGNORE_REQUIRED || {
             enums.name.as_ref().map_or(true, |n| {
                 required_types.contains(n.replace("FlagBits", "Flags").as_str())
             })
@@ -3203,6 +3235,7 @@ pub fn write_source_code<
         .collect();
 
     let root_structs = root_structs::<C>(&vk_parse_types, &required_types);
+    debug!("root_structs: {:#?}", &root_structs);
 
     let vk_parse_types = vk_parse_types
         .into_iter()

@@ -50,7 +50,8 @@ pub trait ApiConfig {
     ///
     /// <https://github.com/ash-rs/ash/blob/aee0c61cf1d466c6cf934f2375063fb88b806476/generator/src/lib.rs#L3374>
     const VENDOR_SUFFIXES: &'static [&'static str];
-    fn function_type<'a>(f: &'a vk_parse::CommandDefinition) -> FunctionType<'a>;
+    const IGNORE_REQUIRED: bool = false;
+    fn function_type(f: &vk_parse::CommandDefinition) -> FunctionType<'_>;
     /// based on original function name, gets the name of a the function pointer type
     ///
     /// e.x. `xrGetInstanceProcAddr` -> `PFN_xrGetInstanceProcAddr`
@@ -58,7 +59,7 @@ pub trait ApiConfig {
     /// return `true` to allow for separate setting of the length member of an array independently
     /// from it's data via a slice
     #[inline(always)]
-    fn member_separate_count(_struct_name: &str, member: &vk_parse::TypeMemberDefinition) -> bool {
+    fn member_separate_count(_struct_name: &str, _member: &vk_parse::TypeMemberDefinition) -> bool {
         false
     }
     /// return `false` to disable creation of the builder pattern functions
@@ -80,7 +81,17 @@ pub trait ApiConfig {
     /// Use to override conversion of type name to variant prefix string,
     ///
     /// i.e. `XrStructureType` -> `XR_TYPE_`
-    fn variant_prefix<'a>(_type_name: &'a str) -> Option<Cow<'a, str>> {
+    fn variant_prefix(_type_name: &str) -> Option<Cow<'_, str>> {
+        None
+    }
+
+    /// use to generate code for `#define`s, like [`crate::vulkan::Vulkan`] does for its
+    /// `_VERSION_` macros
+    #[inline(always)]
+    fn generate_define(
+        _name: &str,
+        _spec: &vk_parse::TypeCode,
+    ) -> Option<TokenStream> {
         None
     }
 }
@@ -96,7 +107,7 @@ pub trait ApiExt: ApiConfig {
     }
 
     fn name_to_tokens(type_name: &str) -> Ident {
-        let new_name = match type_name.as_ref() {
+        let new_name = match type_name {
             "uint8_t" => "u8",
             "uint16_t" => "u16",
             "uint32_t" => "u32",
@@ -133,7 +144,7 @@ pub trait ApiExt: ApiConfig {
         s.strip_prefix(Self::TYPE_PREFIX)
     }
 
-    fn strip_vendor_suffix<'a>(name: &'a str) -> (&'static str, &'a str) {
+    fn strip_vendor_suffix(name: &str) -> (&'static str, &str) {
         Self::VENDOR_SUFFIXES.iter().copied()
             .filter_map(|vendor| name.strip_vendor_suffix(vendor).map(move |n| (vendor, n)))
             .max_by_key(|(vendor, ..)| vendor.len())

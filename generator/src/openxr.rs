@@ -3,21 +3,9 @@ use proc_macro2::{
     Ident,
 };
 use quote::format_ident;
-use std::{
-    borrow::Cow,
-    cmp::PartialEq,
-    collections::{
-        BTreeMap,
-        HashMap,
-        HashSet,
-    },
-    error::Error,
-    iter,
-    path::{
-        Path,
-        PathBuf,
-    },
-};
+use std::
+    borrow::Cow
+;
 use crate::get_variant;
 use crate::config::{
     self,
@@ -51,6 +39,16 @@ impl OpenXR {
     };
 }
 
+macro_rules! xr_vendor_suffixes {
+    ($($v:expr),+ $(,)?) => {
+        &[
+            $(
+                $v,
+            )+
+        ]
+    };
+}
+
 impl ApiConfig for OpenXR {
     const NAME: &'static str = "openxr";
     const MODULE_NAME: &'static str = "xr";
@@ -67,7 +65,7 @@ impl ApiConfig for OpenXR {
         ty: "XrResult",
         prefix: None,
     };
-    const VENDOR_SUFFIXES: &'static [&'static str] = &[
+    const VENDOR_SUFFIXES: &'static [&'static str] = xr_vendor_suffixes!{
         "ACER",
         "ALMALENCE",
         "ANDROID",
@@ -78,6 +76,7 @@ impl ApiConfig for OpenXR {
         "DANWILLM",
         "EPIC",
         "EXT",
+        "EXTX",
         "FB",
         "FREDEMMOTT",
         "GOOGLE",
@@ -105,7 +104,8 @@ impl ApiConfig for OpenXR {
         "VALVE",
         "VARJO",
         "YVR",
-    ];
+    };
+    const IGNORE_REQUIRED: bool = true;
     fn function_type<'a>(f: &'a vk_parse::CommandDefinition) -> FunctionType<'a> {
         const DEFAULT_TYPE: FunctionType<'static> = FunctionType::Dispatched("Instance");
         Self::FUNCTIONS.function_type(f, |s| s.strip_prefix(Self::TYPE_PREFIX).unwrap_or(s))
@@ -122,6 +122,7 @@ impl ApiConfig for OpenXR {
         match type_name {
             "XrStructureType" => Some(Cow::from("XR_TYPE")),
             "XrPerfSettingsNotificationLevelEXT" => Some(Cow::from("XR_PERF_SETTINGS_NOTIF_LEVEL")),
+            "XrLoaderInterfaceStructs" => Some(Cow::from("XR_LOADER_INTERFACE_STRUCT")),
             _ => None,
         }
     }

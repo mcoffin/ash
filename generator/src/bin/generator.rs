@@ -51,7 +51,7 @@ fn project_dir() -> Result<&'static Path, SharedError> {
 }
 
 impl Args {
-    fn output_dir<'a>(&'a self) -> Result<&'a Path, SharedError> {
+    fn output_dir(&self) -> Result<&Path, SharedError> {
         if let Some(p) = self.out_dir.as_deref() {
             return Ok(p);
         }

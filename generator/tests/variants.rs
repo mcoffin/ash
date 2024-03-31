@@ -12,6 +12,10 @@ fn vulkan_variant_names_correct() {
         variant_ident::<Vulkan>("VkCullModeFlagBits", "VK_CULL_MODE_FRONT_AND_BACK").to_string(),
         "FRONT_AND_BACK"
     );
+    assert_eq!(
+        variant_ident::<Vulkan>("VkStructureType", "VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO").to_string(),
+        "INSTANCE_CREATE_INFO"
+    )
 }
 
 #[cfg(feature = "openxr")]

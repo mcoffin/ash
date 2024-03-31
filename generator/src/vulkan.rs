@@ -48,8 +48,8 @@ impl ApiConfig for Vulkan {
     const CONSTANT_PREFIX: &'static str = "VK_";
     const TAGGED_STRUCT: StructConfig<'static> = StructConfig {
         ty: "VkStructureType",
-        ty_name: "s_type",
-        next_name: "p_next",
+        ty_name: "sType",
+        next_name: "pNext",
     };
     const RESULT_ENUM: ResultConfig<'static> = ResultConfig {
         ty: "VkResult",
@@ -179,4 +179,56 @@ impl ApiConfig for Vulkan {
     fn generate_accessors(struct_name: &str) -> bool {
         !Vulkan::ACCESSOR_BLACKLIST.contains(&struct_name)
     }
+    // fn generate_define(
+    //     define_name: &str,
+    //     spec: &vk_parse::TypeCode,
+    // ) -> Option<TokenStream> {
+    //     let name = C::strip_constant_prefix(define_name)
+    //         .unwrap_or(define_name);
+    //     let ident = format_ident!("{}", name);
+
+    //     if define_name.contains("VERSION") && !spec.code.contains("//#define") {
+    //         let link = khronos_link(define_name);
+    //         let (c_expr, (comment, (_name, parameters))) = parse_c_define_header(&spec.code).unwrap();
+    //         let c_expr = c_expr.trim().trim_start_matches('\\');
+    //         let c_expr = c_expr.replace("(uint32_t)", "");
+    //         let c_expr = convert_c_expression::<C>(&c_expr, identifier_renames);
+    //         let c_expr = discard_outmost_delimiter(c_expr);
+
+    //         let deprecated = comment
+    //             .and_then(|c| c.trim().strip_prefix("DEPRECATED: "))
+    //             .map(|comment| quote!(#[deprecated = #comment]))
+    //             .or_else(|| match define.deprecated.as_ref()?.as_str() {
+    //                 "true" => Some(quote!(#[deprecated])),
+    //                 "aliased" => {
+    //                     Some(quote!(#[deprecated = "an old name not following Vulkan conventions"]))
+    //                 }
+    //                 x => panic!("Unknown deprecation reason {}", x),
+    //             });
+
+    //         let (code, ident) = if let Some(parameters) = parameters {
+    //             let params = parameters
+    //                 .iter()
+    //                 .map(|param| format_ident!("{}", param))
+    //                 .map(|i| quote!(#i: u32));
+    //             let ident = format_ident!("{}", name.to_lowercase());
+    //             (
+    //                 quote!(pub const fn #ident(#(#params),*) -> u32 { #c_expr }),
+    //                 ident,
+    //             )
+    //         } else {
+    //             (quote!(pub const #ident: u32 = #c_expr;), ident)
+    //         };
+
+    //         identifier_renames.insert(define_name.clone(), ident);
+
+    //         Some(quote! {
+    //             #deprecated
+    //             #[doc = #link]
+    //             #code
+    //         })
+    //     } else {
+    //         None
+    //     }
+    // }
 }
