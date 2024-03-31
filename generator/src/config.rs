@@ -3,7 +3,10 @@ use proc_macro2::{
     TokenStream,
     Span,
 };
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    path::Path,
+};
 use crate::util::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +96,10 @@ pub trait ApiConfig {
         _spec: &vk_parse::TypeCode,
     ) -> Option<TokenStream> {
         None
+    }
+
+    fn update_bindgen_header(header: &str, _registry_path: &Path, bindings: bindgen::Builder) -> bindgen::Builder {
+        bindings.header(header)
     }
 }
 

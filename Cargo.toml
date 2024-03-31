@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "analysis",
     "ash",
+    "ash-xr",
     "ash-examples",
     "ash-rewrite",
     "ash-window",

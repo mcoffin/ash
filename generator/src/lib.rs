@@ -848,13 +848,13 @@ impl FieldExt for vkxml::Field {
         assert!(!self.is_void());
         let ty = C::name_to_tokens(&self.basetype);
 
-        if is_static_array(self) {
+        if let Some(size) = self
+            .size_enumref
+            .as_ref()
+            .or(self.size.as_ref())
+            .filter(|_| is_static_array(self)) {
+
             assert!(self.reference.is_none());
-            let size = self
-                .size_enumref
-                .as_ref()
-                .or(self.size.as_ref())
-                .expect("Should have size");
             // Make sure we also rename the constant, that is
             // used inside the static array
             let size = convert_c_expression::<C>(size, &BTreeMap::new());
@@ -1135,13 +1135,14 @@ where
         }
     }
 
-    struct CommandToMember<'a>(&'a Command<'a>);
-    impl<'a> quote::ToTokens for CommandToMember<'a> {
+    struct CommandToMember<'a, C: ApiConfig + ?Sized>(&'a Command<'a>, PhantomData<&'a C>);
+    impl<'a, C: ApiConfig + ?Sized> quote::ToTokens for CommandToMember<'a, C> {
         fn to_tokens(&self, tokens: &mut TokenStream) {
             let type_name = &self.0.pfn_type_name;
+            let mod_ident = Ident::new(C::MODULE_NAME, Span::call_site());
             let type_name = if let Some((vendor, ext)) = &self.0.type_in_module {
                 // Type is defined in another module
-                quote!(crate::vk::#vendor::#ext::#type_name)
+                quote!(crate::#mod_ident::#vendor::#ext::#type_name)
             } else {
                 // Type is defined in local scope
                 quote!(#type_name)
@@ -1199,7 +1200,7 @@ where
         .iter()
         .filter(|pfn| pfn.type_in_module.is_none())
         .map(CommandToType);
-    let members = commands.iter().map(CommandToMember);
+    let members = commands.iter().map(|v| CommandToMember::<'_, C>(v, PhantomData));
 
     let struct_contents = if commands.is_empty() {
         quote! { pub struct #ident; }
@@ -1708,7 +1709,7 @@ where
     C: ApiConfig + ?Sized,
 {
     let name = C::name_to_tokens(&struct_.name);
-    let is_structure_type = |&vkxml::Field { ref basetype, .. }| basetype.as_str() == C::TAGGED_STRUCT.ty;
+    let is_structure_type = |f: &vkxml::Field| f.basetype.as_str() == C::TAGGED_STRUCT.ty;
 
     // These are also pointers, and therefor also don't implement Default. The spec
     // also doesn't mark them as pointers
@@ -2010,29 +2011,27 @@ where
 
         if field.basetype == "char" {
             let param_ident_as_c_str = format_ident!("{}_as_c_str", param_ident_short);
-            if matches!(field.reference, Some(vkxml::ReferenceType::Pointer)) {
-                assert!(field.null_terminate);
-                assert_eq!(field.size, None);
-                return Some(quote! {
-                    #deprecated
-                    #[inline]
-                    pub fn #param_ident_short(mut self, #param_ident_short: &'a CStr) -> Self {
-                        self.#param_ident = #param_ident_short.as_ptr();
-                        self
-                    }
-                    #deprecated
-                    #[inline]
-                    pub unsafe fn #param_ident_as_c_str(&self) -> Option<&CStr> {
-                        if self.#param_ident.is_null() {
-                            None
-                        } else {
-                            Some(CStr::from_ptr(self.#param_ident))
+            let ret = match field {
+                vkxml::Field { reference: Some(vkxml::ReferenceType::Pointer), null_terminate: true, size: None, .. } => {
+                    return Some(quote! {
+                        #deprecated
+                        #[inline]
+                        pub fn #param_ident_short(mut self, #param_ident_short: &'a CStr) -> Self {
+                            self.#param_ident = #param_ident_short.as_ptr();
+                            self
                         }
-                    }
-                });
-            } else if is_static_array(field) {
-                assert_eq!(field.size, None);
-                return Some(quote! {
+                        #deprecated
+                        #[inline]
+                        pub unsafe fn #param_ident_as_c_str(&self) -> Option<&CStr> {
+                            if self.#param_ident.is_null() {
+                                None
+                            } else {
+                                Some(CStr::from_ptr(self.#param_ident))
+                            }
+                        }
+                    })
+                },
+                f if is_static_array(f) && f.size.is_none() => Some(quote! {
                     #deprecated
                     #[inline]
                     pub fn #param_ident_short(mut self, #param_ident_short: &CStr) -> core::result::Result<Self, CStrTooLargeForStaticArray> {
@@ -2043,7 +2042,14 @@ where
                     pub fn #param_ident_as_c_str(&self) -> core::result::Result<&CStr, FromBytesUntilNulError> {
                         wrap_c_str_slice_until_nul(&self.#param_ident)
                     }
-                });
+                }),
+                f => {
+                    warn!("failed to generate accessor methods for field: {:?}", f);
+                    None
+                },
+            };
+            if ret.is_some() {
+                return ret;
             }
         }
 
@@ -2263,29 +2269,30 @@ where
             quote!(unsafe impl #extends for #name<'_> {})
         });
 
-    let impl_structure_type_trait = tag_info.as_ref().map(|TaggedStructInfo { type_field: member, .. }| {
-        let struct_name = &struct_.name;
-        let m_field = &member.vkxml_field;
-        let value = member
-            .vkxml_field
-            .type_enums
-            .as_deref()
-            .unwrap_or_else(|| {
-                panic!("{struct_name} -> {m_field:?} did not have an entry value in xml");
-            });
+    let impl_structure_type_trait = tag_info.as_ref().into_iter()
+        .flat_map(|TaggedStructInfo { type_field: member, .. }| -> Option<TokenStream> {
+            let struct_name = &struct_.name;
+            let m_field = &member.vkxml_field;
+            let value = member
+                .vkxml_field
+                .type_enums
+                .as_deref()?;
+                // .unwrap_or_else(|| {
+                //     panic!("{struct_name} -> {m_field:?} did not have an entry value in xml");
+                // });
 
-        assert!(!value.contains(','));
+            assert!(!value.contains(','));
 
-        let value = variant_ident::<C>(C::TAGGED_STRUCT.ty, value);
-        quote! {
-            unsafe impl #lifetime TaggedStructure for #name #lifetime {
-                const STRUCTURE_TYPE: StructureType = StructureType::#value;
-            }
-        }
-    });
+            let value = variant_ident::<C>(C::TAGGED_STRUCT.ty, value);
+            Some(quote! {
+                unsafe impl #lifetime TaggedStructure for #name #lifetime {
+                    const STRUCTURE_TYPE: StructureType = StructureType::#value;
+                }
+            })
+        });
 
     let q = quote! {
-        #impl_structure_type_trait
+        #(#impl_structure_type_trait)*
         #(#impl_extend_trait)*
         #next_trait
 
@@ -2395,15 +2402,20 @@ where
         quote!()
     };
     let default_str = if default_tokens.is_none() {
-        quote!(Default,)
+        Some(quote!(Default))
     } else {
-        quote!()
+        None
     };
     let khronos_link = khronos_link(&struct_.name);
+    let derives = [
+        Some(quote!(Copy, Clone)),
+        default_str,
+        manual_derive_tokens,
+    ].into_iter().flatten();
     quote! {
         #[repr(C)]
         #dbg_str
-        #[derive(Copy, Clone, #default_str #manual_derive_tokens)]
+        #[derive( #( #derives ),* )]
         #[doc = #khronos_link]
         #[must_use]
         pub struct #name #lifetimes {
@@ -2699,9 +2711,10 @@ pub fn generate_constant<'a, C: ApiConfig + ?Sized>(
     let ident = format_ident!("{}", name);
     let notation = constant.doc_attribute();
 
-    // let ty = config.constant_type_override(name, &c)
-    //     .unwrap_or(c.ty());
-    let ty = c.ty();
+    let ty = match name {
+        "TRUE" | "FALSE" => CType::Bool32,
+        _ => c.ty(),
+    };
     quote! {
         #notation
         pub const #ident: #ty = #c;
@@ -3297,11 +3310,13 @@ pub fn write_source_code<
         File::create(vk_dir.join("const_debugs.rs")).expect("vk/const_debugs.rs");
     let vk_aliases_file = File::create(vk_dir.join("aliases.rs")).expect("vk/aliases.rs");
 
+    let mod_ident = Ident::new(C::MODULE_NAME, Span::call_site());
+    let mod_ident = &mod_ident;
     let feature_code = quote! {
         use core::ffi::*;
-        use crate::vk::bitflags::*;
-        use crate::vk::definitions::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::definitions::*;
+        use crate::#mod_ident::enums::*;
         #(#feature_code)*
     };
 
@@ -3309,14 +3324,14 @@ pub fn write_source_code<
         use core::marker::PhantomData;
         use core::fmt;
         use core::ffi::*;
-        use crate::vk::{Handle, ptr_chain_iter};
-        use crate::vk::aliases::*;
-        use crate::vk::bitflags::*;
-        use crate::vk::constants::*;
-        use crate::vk::enums::*;
-        use crate::vk::native::*;
-        use crate::vk::platform_types::*;
-        use crate::vk::prelude::*;
+        use crate::#mod_ident::{Handle, ptr_chain_iter};
+        use crate::#mod_ident::aliases::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::constants::*;
+        use crate::#mod_ident::enums::*;
+        use crate::#mod_ident::native::*;
+        use crate::#mod_ident::platform_types::*;
+        use crate::#mod_ident::prelude::*;
         #(#definition_code)*
     };
 
@@ -3327,12 +3342,12 @@ pub fn write_source_code<
     };
 
     let bitflags_code = quote! {
-        use crate::vk::definitions::*;
+        use crate::#mod_ident::definitions::*;
         #(#bitflags_code)*
     };
 
     let constants_code = quote! {
-        use crate::vk::definitions::*;
+        use crate::#mod_ident::definitions::*;
         #(#constants_code)*
     };
 
@@ -3341,34 +3356,34 @@ pub fn write_source_code<
         #![allow(unused_imports)]        // for sometimes-dead `use` in extension modules
 
         use core::ffi::*;
-        use crate::vk::platform_types::*;
-        use crate::vk::aliases::*;
-        use crate::vk::bitflags::*;
-        use crate::vk::definitions::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::platform_types::*;
+        use crate::#mod_ident::aliases::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::definitions::*;
+        use crate::#mod_ident::enums::*;
         #(#extension_constants)*
         #(#extension_cmds)*
     };
 
     let feature_extensions_code = quote! {
-        use crate::vk::bitflags::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::enums::*;
        #feature_extensions_code
     };
 
     let const_debugs = quote! {
         use core::fmt;
-        use crate::vk::bitflags::*;
-        use crate::vk::definitions::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::definitions::*;
+        use crate::#mod_ident::enums::*;
         use crate::prelude::debug_flags;
         #const_debugs
     };
 
     let aliases = quote! {
-        use crate::vk::bitflags::*;
-        use crate::vk::definitions::*;
-        use crate::vk::enums::*;
+        use crate::#mod_ident::bitflags::*;
+        use crate::#mod_ident::definitions::*;
+        use crate::#mod_ident::enums::*;
         #(#aliases)*
     };
 
@@ -3405,22 +3420,16 @@ pub fn write_source_code<
 
     let vk_include = vk_headers_dir.join("include");
 
-    let mut bindings = bindgen::Builder::default().use_core().clang_arg(format!(
-        "-I{}",
-        vk_include.to_str().expect("Valid UTF8 string")
-    ));
+    let mut bindings = bindgen::Builder::default().use_core()
+        .clang_arg(format!(
+            "-I{}",
+            vk_include.to_str().expect("Valid UTF8 string")
+        ));
 
     let (header_includes, header_types) = extract_native_types(&spec2);
 
     for (_name, path) in header_includes {
-        let path = if path == "vk_platform.h" {
-            // Fix broken path, https://github.com/KhronosGroup/Vulkan-Docs/pull/1538
-            // Reintroduced in: https://github.com/KhronosGroup/Vulkan-Docs/issues/1573
-            vk_include.join("vulkan").join(path)
-        } else {
-            vk_include.join(path)
-        };
-        bindings = bindings.header(path.to_str().expect("Valid UTF8 string"));
+        bindings = C::update_bindgen_header(path.as_str(), vk_include.as_ref(), bindings);
     }
 
     for typ in header_types {

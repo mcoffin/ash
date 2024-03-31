@@ -2,10 +2,14 @@ use proc_macro2::{
     TokenStream,
     Ident,
 };
-use quote::format_ident;
-use std::
+use quote::{
+    quote,
+    format_ident,
+};
+use std::{
+    path::Path,
     borrow::Cow
-;
+};
 use crate::get_variant;
 use crate::config::{
     self,
@@ -17,6 +21,8 @@ use super::{
     ConstantTypeInfo,
     EnumType,
 };
+use regex::Regex;
+use once_cell::sync::Lazy;
 
 #[derive(Debug, Clone, Copy)]
 pub struct OpenXR;
@@ -124,6 +130,23 @@ impl ApiConfig for OpenXR {
             "XrPerfSettingsNotificationLevelEXT" => Some(Cow::from("XR_PERF_SETTINGS_NOTIF_LEVEL")),
             "XrLoaderInterfaceStructs" => Some(Cow::from("XR_LOADER_INTERFACE_STRUCT")),
             _ => None,
+        }
+    }
+    fn update_bindgen_header(header: &str, _registry_path: &Path, bindings: bindgen::Builder) -> bindgen::Builder {
+        static OXR_HEADER: Lazy<Regex> = Lazy::new(|| Regex::new(r"^openxr.*\.h$").unwrap());
+        let path = if OXR_HEADER.is_match_at(header, 0) {
+            Cow::Owned(format!("/usr/include/openxr/{}", header))
+        } else {
+            Cow::Borrowed(header)
+        };
+        bindings.header(path)
+    }
+    fn manual_derives(name: &str) -> Option<TokenStream> {
+        static NORMAL_STRUCT: Lazy<Regex> = Lazy::new(|| Regex::new(r"^Xr((Extent)|(Rect)|(Offset))[0-9]D$").unwrap());
+        if NORMAL_STRUCT.is_match(name) {
+            Some(quote!(PartialEq, Eq, Hash))
+        } else {
+            None
         }
     }
 }

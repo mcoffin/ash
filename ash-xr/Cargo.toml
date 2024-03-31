@@ -1,0 +1,37 @@
+[package]
+name = "ash-xr"
+version = "0.37.0"
+authors = [
+    "Maik Klein <maikklein@googlemail.com>",
+    "Benjamin Saunders <ben.e.saunders@gmail.com>",
+    "Marijn Suijten <marijn@traverseresearch.nl>",
+    "Matt Coffin <mcoffin13@gmail.com>"
+]
+description = "OpenXR bindings for Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ash-rs/ash"
+readme = "../README.md"
+keywords = ["gamedev", "openxr", "bindings"]
+edition = "2021"
+
+[dependencies]
+libloading = { version = "0.8", optional = true }
+ash = { path = "../ash" }
+
+[features]
+default = ["loaded", "debug", "std"]
+# Link the Vulkan loader at compile time.
+linked = ["ash/linked"]
+# Support searching for the Vulkan loader manually at runtime.
+loaded = ["libloading", "std", "ash/loaded"]
+# Whether Vulkan structs should implement Debug.
+debug = ["ash/debug"]
+# Whether the standard library should be required
+std = []
+
+[package.metadata.release]
+no-dev-version = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

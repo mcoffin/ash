@@ -4,6 +4,7 @@ use proc_macro2::{
     Ident,
     TokenStream,
 };
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Vulkan;
@@ -175,9 +176,17 @@ impl ApiConfig for Vulkan {
         }
     }
 
+    fn manual_derives(struct_name: &str) -> Option<TokenStream> {
+        match struct_name {
+            "VkClearRect" | "VkExtent2D" | "VkExtent3D" | "VkOffset2D" | "VkOffset3D" | "VkRect2D"
+            | "VkSurfaceFormatKHR" => Some(quote! {PartialEq, Eq, Hash}),
+            _ => None,
+        }
+    }
+
     #[inline(always)]
     fn generate_accessors(struct_name: &str) -> bool {
-        !Vulkan::ACCESSOR_BLACKLIST.contains(&struct_name)
+        !Self::ACCESSOR_BLACKLIST.contains(&struct_name)
     }
     // fn generate_define(
     //     define_name: &str,
@@ -231,4 +240,14 @@ impl ApiConfig for Vulkan {
     //         None
     //     }
     // }
+    fn update_bindgen_header(header: &str, registry_path: &Path, bindings: bindgen::Builder) -> bindgen::Builder {
+        let path = if header == "vk_platform.h" {
+            // Fix broken path, https://github.com/KhronosGroup/Vulkan-Docs/pull/1538
+            // Reintroduced in: https://github.com/KhronosGroup/Vulkan-Docs/issues/1573
+            registry_path.join("vulkan").join(header)
+        } else {
+            registry_path.join(header)
+        };
+        bindings.header(path.to_str().expect("Valid UTF8 string"))
+    }
 }
