@@ -23,6 +23,9 @@ pub use prelude::*;
 #[allow(clippy::useless_transmute, nonstandard_style)]
 mod native;
 pub use native::*;
+#[path = "./xr_platform_types.rs"]
+mod platform_types;
+pub use platform_types::*;
 
 macro_rules! chain_iter {
     ($name:ident : $t:ident, $next:ident) => {

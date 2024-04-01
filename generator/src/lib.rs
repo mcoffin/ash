@@ -1453,7 +1453,8 @@ where
 pub fn generate_define<C: ApiConfig + ?Sized>(
     define: &vk_parse::Type,
     allowed_types: &HashSet<&str>,
-    _identifier_renames: &mut BTreeMap<String, Ident>,
+    deprecated: Option<&str>,
+    identifier_renames: &mut BTreeMap<String, Ident>,
 ) -> TokenStream {
     let vk_parse::TypeSpec::Code(spec) = &define.spec else {
         return quote!();
@@ -1464,7 +1465,7 @@ pub fn generate_define<C: ApiConfig + ?Sized>(
     if !allowed_types.contains(define_name.as_str()) && !C::IGNORE_REQUIRED {
         return quote!();
     }
-    C::generate_define(define_name, spec)
+    C::generate_define(define_name, spec, deprecated, identifier_renames)
         .unwrap_or_else(|| quote!())
 }
 pub fn generate_typedef<C>(
@@ -1473,13 +1474,25 @@ pub fn generate_typedef<C>(
 where
     C: ApiConfig + ?Sized,
 {
+    let khronos_link = khronos_link(&typedef.name);
     if typedef.basetype.is_empty() {
         // Ignore forward declarations
         quote! {}
+    } else if typedef.basetype.strip_prefix(C::CONSTANT_PREFIX) == Some("DEFINE_ATOM") {
+        let typedef_name = C::name_to_tokens(&typedef.name);
+        quote! {
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+            #[doc = #khronos_link]
+            #[repr(transparent)]
+            pub struct #typedef_name(pub u64);
+
+            impl #typedef_name {
+                pub const fn null() -> Self { #typedef_name(0x0) }
+            }
+        }
     } else {
         let typedef_name = C::name_to_tokens(&typedef.name);
         let typedef_ty = C::name_to_tokens(&typedef.basetype);
-        let khronos_link = khronos_link(&typedef.name);
         quote! {
             #[doc = #khronos_link]
             pub type #typedef_name = #typedef_ty;
@@ -2213,6 +2226,7 @@ where
     // We only implement a next method for root structs with a `pnext` field.
     let next_function = if let Some(next_member) = root_struct_next_field {
         let next_field = &next_member.vkxml_field;
+        let next_ident = next_field.param_ident();
         assert_eq!(next_field.basetype, "void");
         let mutability = if next_field.is_const {
             quote!(const)
@@ -2238,8 +2252,8 @@ where
                     //                 ^^^^^^
                     //                 next chain
                     let last_next = ptr_chain_iter(next).last().unwrap();
-                    (*last_next).p_next = self.p_next as _;
-                    self.p_next = next_ptr;
+                    (*last_next).#next_ident = self.#next_ident as _;
+                    self.#next_ident = next_ptr;
                 }
                 self
             }
@@ -2561,6 +2575,7 @@ pub fn generate_definition_vk_parse<C: ApiConfig + ?Sized>(
         Some("define") => Some(generate_define::<C>(
             definition,
             allowed_types,
+            definition.deprecated.as_deref(),
             identifier_renames,
         )),
         _ => None,

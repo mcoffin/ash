@@ -5,6 +5,7 @@ use proc_macro2::{
 };
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     path::Path,
 };
 use crate::util::*;
@@ -94,6 +95,8 @@ pub trait ApiConfig {
     fn generate_define(
         _name: &str,
         _spec: &vk_parse::TypeCode,
+        _deprecated: Option<&str>,
+        _identifier_renames: &mut BTreeMap<String, Ident>,
     ) -> Option<TokenStream> {
         None
     }

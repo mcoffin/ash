@@ -6,9 +6,10 @@ members = [
     "ash-xr",
     "ash-examples",
     "ash-rewrite",
-    "ash-window",
-    "generator",
-    "generator-rewrite",
+]
+exclude = [
+	"generator",
+	"generator-rewrite",
 ]
 
 [patch.crates-io.vk-parse]
