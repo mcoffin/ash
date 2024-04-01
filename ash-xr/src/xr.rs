@@ -1,6 +1,9 @@
 mod aliases;
 pub use aliases::*;
-mod bitflags;
+mod bitflags {
+    use ash::vk::Flags;
+    include!("./xr/bitflags.rs");
+}
 pub use bitflags::*;
 mod constants;
 pub use constants::*;

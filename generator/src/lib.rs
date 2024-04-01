@@ -1738,6 +1738,10 @@ where
         "MTLDevice_id",
         "MTLSharedEvent_id",
         "MTLTexture_id",
+        // OpenXR
+        "EGLContext",
+        "EGLDisplay",
+        "EGLConfig",
     ];
     let contains_ptr = members
         .iter()

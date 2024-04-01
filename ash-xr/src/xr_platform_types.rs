@@ -1,4 +1,4 @@
-use std::os::raw::*;
+include!("../../ash/src/vk/platform_types.rs");
 pub use ash::vk::{
     AllocationCallbacks as VkAllocationCallbacks,
     ComponentSwizzle as VkComponentSwizzle,
@@ -15,6 +15,9 @@ pub use ash::vk::{
     Result as VkResult,
     SamplerAddressMode as VkSamplerAddressMode,
     SamplerMipmapMode as VkSamplerMipmapMode,
+    PFN_vkGetInstanceProcAddr,
 };
 pub type EGLenum = c_uint;
 pub type EGLContext = *mut c_void;
+pub type EGLDisplay = *mut c_void;
+pub type EGLConfig = *mut c_void;
