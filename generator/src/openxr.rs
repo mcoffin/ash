@@ -130,6 +130,10 @@ impl ApiConfig for OpenXR {
             "XrStructureType" => Some(Cow::from("XR_TYPE")),
             "XrPerfSettingsNotificationLevelEXT" => Some(Cow::from("XR_PERF_SETTINGS_NOTIF_LEVEL")),
             "XrLoaderInterfaceStructs" => Some(Cow::from("XR_LOADER_INTERFACE_STRUCT")),
+            "XrFaceExpression2FB" => Some(Cow::from("XR_FACE_EXPRESSION2")),
+            "XrFaceExpressionSet2FB" => Some(Cow::from("XR_FACE_EXPRESSION_SET2")),
+            "XrFaceTrackingDataSource2FB" => Some(Cow::from("XR_FACE_TRACKING_DATA_SOURCE2")),
+            "XrFaceConfidence2FB" => Some(Cow::from("XR_FACE_CONFIDENCE2")),
             _ => None,
         }
     }

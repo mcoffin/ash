@@ -1974,11 +1974,6 @@ impl<'a> WriteDescriptorSet<'a> {
         self
     }
     #[inline]
-    pub fn descriptor_count(mut self, descriptor_count: u32) -> Self {
-        self.descriptor_count = descriptor_count;
-        self
-    }
-    #[inline]
     pub fn descriptor_type(mut self, descriptor_type: DescriptorType) -> Self {
         self.descriptor_type = descriptor_type;
         self
@@ -3524,11 +3519,6 @@ impl<'a> DescriptorSetLayoutBinding<'a> {
         self
     }
     #[inline]
-    pub fn descriptor_count(mut self, descriptor_count: u32) -> Self {
-        self.descriptor_count = descriptor_count;
-        self
-    }
-    #[inline]
     pub fn stage_flags(mut self, stage_flags: ShaderStageFlags) -> Self {
         self.stage_flags = stage_flags;
         self
@@ -4367,19 +4357,9 @@ impl<'a> PipelineViewportStateCreateInfo<'a> {
         self
     }
     #[inline]
-    pub fn viewport_count(mut self, viewport_count: u32) -> Self {
-        self.viewport_count = viewport_count;
-        self
-    }
-    #[inline]
     pub fn viewports(mut self, viewports: &'a [Viewport]) -> Self {
         self.viewport_count = viewports.len() as _;
         self.p_viewports = viewports.as_ptr();
-        self
-    }
-    #[inline]
-    pub fn scissor_count(mut self, scissor_count: u32) -> Self {
-        self.scissor_count = scissor_count;
         self
     }
     #[inline]
@@ -7765,11 +7745,6 @@ impl<'a> FramebufferCreateInfo<'a> {
     #[inline]
     pub fn render_pass(mut self, render_pass: RenderPass) -> Self {
         self.render_pass = render_pass;
-        self
-    }
-    #[inline]
-    pub fn attachment_count(mut self, attachment_count: u32) -> Self {
-        self.attachment_count = attachment_count;
         self
     }
     #[inline]
